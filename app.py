@@ -1,11 +1,15 @@
-# app.py  (Nifty 50 Screener v3 — NSE primary + Yahoo fallback)
+# app.py  (Nifty 50 Screener v4 — FMP primary, works on Streamlit Cloud)
 # ─────────────────────────────────────────────────────────────────────────────
-# v3 changes:
-#   1. NSE India API as PRIMARY data source (not rate-limited on cloud)
-#   2. Yahoo Finance as SECONDARY for Fwd PE, PEG, ROE, EPS growth
-#   3. NSE session with cookie handshake (required by NSE)
-#   4. Universe pulled from NSE index API (more reliable than Wikipedia)
-#   5. Wikipedia as universe fallback if NSE API fails
+# v4 changes:
+#   1. FMP as SOLE data source — works from any IP including Streamlit Cloud
+#   2. Removed Yahoo Finance .info calls (rate-limited on cloud)
+#   3. Removed NSE API calls (cookie-blocked on cloud)
+#   4. FMP /quote        → price, MC, 52W, trailing PE
+#   5. FMP /ratios-ttm   → Fwd PE, PEG, ROE, Op Margin, D/E, Int Coverage
+#   6. FMP /income-statement (quarterly) → EPS, Earn Traj, Revenue
+#   7. FMP /balance-sheet (quarterly)    → ROIC computation
+#   8. yfinance batch download ONLY for momentum (price history — not blocked)
+#   9. Universe: Wikipedia scrape (HTTP only — not blocked)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -45,17 +49,6 @@ QUALITY_THRESHOLDS = {
     "roic_min":         8.0,
     "int_coverage_min": 3.0,
     "op_margin_min":    5.0,
-}
-
-NSE_HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept":          "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer":         "https://www.nseindia.com/",
-    "Connection":      "keep-alive",
-    "Cache-Control":   "no-cache",
-    "Pragma":          "no-cache",
 }
 
 SECTOR_MAP = {
@@ -102,97 +95,90 @@ SECTOR_MAP = {
     "Realty":                         "Real Estate",
 }
 
-# ── NSE Session ───────────────────────────────────────────────────────────────
-@st.cache_resource
-def get_nse_session():
-    """
-    NSE requires visiting the homepage first to get session cookies.
-    Returns a live requests.Session with valid cookies.
-    """
-    session = requests.Session()
-    retry   = Retry(total=3, backoff_factor=1,
-                    status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://",  adapter)
-    session.headers.update(NSE_HEADERS)
+# ── FMP Key ───────────────────────────────────────────────────────────────────
+def get_fmp_key():
     try:
-        # Cookie handshake — required before any API call
-        session.get("https://www.nseindia.com", timeout=15)
-        time.sleep(1.0)
-        session.get("https://www.nseindia.com/market-data/live-equity-market", timeout=15)
-        time.sleep(0.5)
+        k = st.secrets["fmp"]["api_key"]
+        return k if k and k.strip() and k != "YOUR_KEY_HERE" else None
     except Exception:
-        pass
-    return session
+        return None
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def to_num(x):
+    return pd.to_numeric(x, errors="coerce")
 
-def nse_get(endpoint, params=None):
-    """Safe NSE API GET with session cookie handling."""
-    session  = get_nse_session()
-    base_url = "https://www.nseindia.com/api"
+def sf(val):
     try:
-        r = session.get(
-            "{}/{}".format(base_url, endpoint),
-            params=params,
-            timeout=15
-        )
-        if r.status_code == 401:
-            # Session expired — refresh cookies
-            st.cache_resource.clear()
-            session = get_nse_session()
-            r = session.get(
-                "{}/{}".format(base_url, endpoint),
-                params=params,
-                timeout=15
-            )
+        return float(val) if val is not None else None
+    except Exception:
+        return None
+
+def fmt_mc_inr(val):
+    if pd.isna(val) or val == 0:
+        return "N/A"
+    cr = val / 1e7
+    if cr >= 100000:
+        return "₹{:.2f}L Cr".format(cr / 100000)
+    return "₹{:.0f}Cr".format(cr)
+
+def percentile_score(series: pd.Series, ascending=True) -> pd.Series:
+    result = pd.Series(index=series.index, dtype=float)
+    valid  = series.notna()
+    if valid.sum() == 0:
+        return result.fillna(0.0)
+    ranked = series[valid].rank(method="average", ascending=ascending)
+    n      = valid.sum()
+    result[valid]  = (ranked - 1) / (n - 1) * 100.0 if n > 1 else 50.0
+    result[~valid] = 0.0
+    return result
+
+def missing_factor_penalty(row, factor_cols):
+    missing = sum(1 for c in factor_cols if pd.isna(row.get(c)))
+    if missing >= 3: return 0.70
+    if missing == 2: return 0.85
+    return 1.0
+
+def revenue_growth_pct_cagr(rev4):
+    try:
+        if rev4 is None or len(rev4) != 4:
+            return None
+        q1, _, _, q4 = rev4
+        if q1 is None or q4 is None:
+            return None
+        q1, q4 = float(q1), float(q4)
+        if q1 <= 0 or q4 <= 0:
+            return None
+        return ((q4 / q1) ** (1 / 3) - 1) * 100.0
+    except Exception:
+        return None
+
+def fmp_get(endpoint, api_key, params=None):
+    """Safe FMP API call with retry."""
+    base = "https://financialmodelingprep.com/api/v3"
+    p    = params or {}
+    p["apikey"] = api_key
+    try:
+        session = requests.Session()
+        adapter = HTTPAdapter(max_retries=Retry(
+            total=3, backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504]))
+        session.mount("https://", adapter)
+        r = session.get("{}/{}".format(base, endpoint), params=p, timeout=15)
         r.raise_for_status()
         return r.json()
     except Exception:
         return None
 
+def normalise_pct(val):
+    if val is None: return None
+    v = float(val)
+    return v * 100.0 if abs(v) < 5.0 else v
 
-# ── Universe ──────────────────────────────────────────────────────────────────
+
+# ── Universe (Wikipedia) ──────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
 def get_nifty50_universe():
-    """
-    Primary:  NSE /api/equity-stockIndices?index=NIFTY%2050
-    Fallback: Wikipedia NIFTY_50 page
-    Final:    Hardcoded 10-stock minimal list
-    """
-    # ── Strategy 1: NSE Index API ─────────────────────────────────────────
-    try:
-        data = nse_get("equity-stockIndices", {"index": "NIFTY 50"})
-        if data and "data" in data:
-            rows = []
-            for item in data["data"]:
-                symbol = str(item.get("symbol", "")).strip().upper()
-                if not symbol or symbol == "NIFTY 50":
-                    continue
-                industry = str(item.get("industry", "")).strip()
-                gics     = SECTOR_MAP.get(industry)
-                if gics is None:
-                    for nse_name, gics_name in SECTOR_MAP.items():
-                        if (nse_name.lower() in industry.lower()
-                                or industry.lower() in nse_name.lower()):
-                            gics = gics_name
-                            break
-                if gics is None:
-                    gics = industry or "Unknown"
-                rows.append({
-                    "Ticker":     symbol + ".NS",
-                    "NSE Symbol": symbol,
-                    "Sector":     gics,
-                    "NSE Sector": industry,
-                })
-            if len(rows) >= 40:
-                df = pd.DataFrame(rows).drop_duplicates(subset=["Ticker"])
-                st.success("✅ Universe: {} stocks from NSE API".format(len(df)))
-                return df
-    except Exception:
-        pass
-
-    # ── Strategy 2: Wikipedia ─────────────────────────────────────────────
+    """Wikipedia scrape — reliable from cloud, no auth needed."""
     try:
         r = requests.get(
             "https://en.wikipedia.org/wiki/NIFTY_50",
@@ -213,313 +199,233 @@ def get_nifty50_universe():
             for tbl in soup.find_all("table", {"class": "wikitable"}):
                 if len(tbl.find_all("tr")) >= 30:
                     table = tbl; break
+        if table is None:
+            raise RuntimeError("Table not found")
 
-        if table:
-            header_row = table.find("tr")
-            headers    = ([th.get_text(strip=True).lower()
-                           for th in header_row.find_all(["th", "td"])]
-                          if header_row else [])
-            ticker_col = next((i for i, h in enumerate(headers)
-                               if any(k in h for k in ["symbol","ticker","nse"])), 2)
-            sector_col = next((i for i, h in enumerate(headers)
-                               if any(k in h for k in ["sector","industry","gics"])), 1)
-            data = []
-            for row in table.find_all("tr")[1:]:
-                cols = row.find_all(["td","th"])
-                if len(cols) <= max(ticker_col, sector_col):
-                    continue
-                raw_t = re.sub(r"$.*?$", "", cols[ticker_col].get_text(strip=True)).strip()
-                raw_t = re.sub(r"[^A-Za-z0-9&\-]", "", raw_t).upper()
-                raw_s = re.sub(r"$.*?$", "", cols[sector_col].get_text(strip=True)).strip()
-                if not raw_t or len(raw_t) < 2:
-                    continue
-                gics = SECTOR_MAP.get(raw_s)
-                if gics is None:
-                    for nse_name, gics_name in SECTOR_MAP.items():
-                        if nse_name.lower() in raw_s.lower() or raw_s.lower() in nse_name.lower():
-                            gics = gics_name; break
-                data.append({"Ticker": raw_t+".NS", "NSE Symbol": raw_t,
-                              "Sector": gics or raw_s, "NSE Sector": raw_s})
-            if len(data) >= 30:
-                df = pd.DataFrame(data).drop_duplicates(subset=["Ticker"])
-                st.success("✅ Universe: {} stocks from Wikipedia".format(len(df)))
-                return df
-    except Exception:
-        pass
+        header_row = table.find("tr")
+        headers    = ([th.get_text(strip=True).lower()
+                       for th in header_row.find_all(["th","td"])]
+                      if header_row else [])
+        ticker_col = next((i for i,h in enumerate(headers)
+                           if any(k in h for k in ["symbol","ticker","nse"])), 2)
+        sector_col = next((i for i,h in enumerate(headers)
+                           if any(k in h for k in ["sector","industry","gics"])), 1)
+        data = []
+        for row in table.find_all("tr")[1:]:
+            cols  = row.find_all(["td","th"])
+            if len(cols) <= max(ticker_col, sector_col):
+                continue
+            raw_t = re.sub(r"$.*?$", "",
+                           cols[ticker_col].get_text(strip=True)).strip()
+            raw_t = re.sub(r"[^A-Za-z0-9&\-]", "", raw_t).upper()
+            raw_s = re.sub(r"$.*?$", "",
+                           cols[sector_col].get_text(strip=True)).strip()
+            if not raw_t or len(raw_t) < 2:
+                continue
+            gics = SECTOR_MAP.get(raw_s)
+            if gics is None:
+                for nse_name, gics_name in SECTOR_MAP.items():
+                    if (nse_name.lower() in raw_s.lower()
+                            or raw_s.lower() in nse_name.lower()):
+                        gics = gics_name; break
+            data.append({"Ticker":     raw_t + ".NS",
+                         "NSE Symbol": raw_t,
+                         "Sector":     gics or raw_s,
+                         "NSE Sector": raw_s})
+        if len(data) < 30:
+            raise RuntimeError("Only {} rows".format(len(data)))
+        df = pd.DataFrame(data).drop_duplicates(subset=["Ticker"])
+        st.success("✅ Universe: {} stocks from Wikipedia".format(len(df)))
+        return df
+    except Exception as e:
+        st.warning("⚠️ Wikipedia failed: {}. Using fallback.".format(e))
+        return pd.DataFrame([
+            {"Ticker":"RELIANCE.NS",   "NSE Symbol":"RELIANCE",   "Sector":"Energy",                 "NSE Sector":"Oil Gas & Consumable Fuels"},
+            {"Ticker":"TCS.NS",        "NSE Symbol":"TCS",        "Sector":"Information Technology", "NSE Sector":"Information Technology"},
+            {"Ticker":"HDFCBANK.NS",   "NSE Symbol":"HDFCBANK",   "Sector":"Financials",             "NSE Sector":"Financial Services"},
+            {"Ticker":"INFY.NS",       "NSE Symbol":"INFY",       "Sector":"Information Technology", "NSE Sector":"Information Technology"},
+            {"Ticker":"ICICIBANK.NS",  "NSE Symbol":"ICICIBANK",  "Sector":"Financials",             "NSE Sector":"Financial Services"},
+            {"Ticker":"HINDUNILVR.NS", "NSE Symbol":"HINDUNILVR", "Sector":"Consumer Staples",       "NSE Sector":"FMCG"},
+            {"Ticker":"ITC.NS",        "NSE Symbol":"ITC",        "Sector":"Consumer Staples",       "NSE Sector":"FMCG"},
+            {"Ticker":"SBIN.NS",       "NSE Symbol":"SBIN",       "Sector":"Financials",             "NSE Sector":"Financial Services"},
+            {"Ticker":"BHARTIARTL.NS", "NSE Symbol":"BHARTIARTL", "Sector":"Communication Services", "NSE Sector":"Telecommunication"},
+            {"Ticker":"LT.NS",         "NSE Symbol":"LT",         "Sector":"Industrials",            "NSE Sector":"Construction"},
+        ])
 
-    # ── Strategy 3: Hardcoded fallback ───────────────────────────────────
-    st.warning("⚠️ Using hardcoded fallback universe (10 stocks). NSE API and Wikipedia both failed.")
-    return pd.DataFrame([
-        {"Ticker":"RELIANCE.NS",   "NSE Symbol":"RELIANCE",   "Sector":"Energy",                 "NSE Sector":"Oil Gas & Consumable Fuels"},
-        {"Ticker":"TCS.NS",        "NSE Symbol":"TCS",        "Sector":"Information Technology", "NSE Sector":"Information Technology"},
-        {"Ticker":"HDFCBANK.NS",   "NSE Symbol":"HDFCBANK",   "Sector":"Financials",             "NSE Sector":"Financial Services"},
-        {"Ticker":"INFY.NS",       "NSE Symbol":"INFY",       "Sector":"Information Technology", "NSE Sector":"Information Technology"},
-        {"Ticker":"ICICIBANK.NS",  "NSE Symbol":"ICICIBANK",  "Sector":"Financials",             "NSE Sector":"Financial Services"},
-        {"Ticker":"HINDUNILVR.NS", "NSE Symbol":"HINDUNILVR", "Sector":"Consumer Staples",       "NSE Sector":"FMCG"},
-        {"Ticker":"ITC.NS",        "NSE Symbol":"ITC",        "Sector":"Consumer Staples",       "NSE Sector":"FMCG"},
-        {"Ticker":"SBIN.NS",       "NSE Symbol":"SBIN",       "Sector":"Financials",             "NSE Sector":"Financial Services"},
-        {"Ticker":"BHARTIARTL.NS", "NSE Symbol":"BHARTIARTL", "Sector":"Communication Services", "NSE Sector":"Telecommunication"},
-        {"Ticker":"LT.NS",         "NSE Symbol":"LT",         "Sector":"Industrials",            "NSE Sector":"Construction"},
-    ])
 
-
-# ── NSE Quote (primary — price, PE, MC, 52W) ──────────────────────────────────
+# ── FMP Quote (price, MC, 52W, trailing PE) ───────────────────────────────────
 @st.cache_data(ttl=3600)
-def fetch_nse_quotes(tickers):
+def fetch_fmp_quotes(tickers, api_key):
     """
-    Fetch price, trailing PE, market cap, 52W high/low from NSE quote API.
-    NSE /api/quote-equity?symbol=RELIANCE
+    FMP /quote/{symbols} — bulk endpoint, all 50 tickers in one call.
+    Returns price, marketCap, 52W high/low, PE.
+    """
+    out = {t: {} for t in tickers}
+    tl  = list(tickers)
+    # FMP accepts comma-separated symbols
+    chunks = [tl[i:i+50] for i in range(0, len(tl), 50)]
+    for chunk in chunks:
+        syms = ",".join(chunk)
+        data = fmp_get("quote/{}".format(syms), api_key)
+        if not data or not isinstance(data, list):
+            continue
+        for item in data:
+            sym = str(item.get("symbol","")).upper().strip()
+            if sym not in out:
+                continue
+            pe  = sf(item.get("pe"))
+            mc  = sf(item.get("marketCap"))
+            hi  = sf(item.get("yearHigh"))
+            lo  = sf(item.get("yearLow"))
+            px  = sf(item.get("price"))
+            out[sym] = {
+                "price": px,
+                "mc":    mc,
+                "hi52":  hi,
+                "lo52":  lo,
+                "pe":    pe if (pe and 0 < pe <= 10000) else None,
+            }
+        time.sleep(0.3)
+    return out
+
+
+# ── FMP Ratios TTM (Fwd PE, ROE, Op Margin, D/E, Int Coverage, PEG) ──────────
+@st.cache_data(ttl=86400)
+def fetch_fmp_ratios(tickers, api_key):
+    """
+    FMP /ratios-ttm/{symbol} — one call per ticker.
+    Provides ROE, Op Margin, D/E, Int Coverage, ROIC.
     """
     out = {}
     tl  = list(tickers)
 
-    def fetch_one_nse(symbol_ns):
-        symbol = symbol_ns.replace(".NS", "")
-        try:
-            data = nse_get("quote-equity", {"symbol": symbol})
-            if not data:
-                return symbol_ns, {}
-            pd_data   = data.get("priceInfo",      {})
-            meta      = data.get("metadata",       {})
-            sec_info  = data.get("securityInfo",   {})
-            ind_info  = data.get("industryInfo",   {})
+    def one(t):
+        data = fmp_get("ratios-ttm/{}".format(t), api_key)
+        if not data or not isinstance(data, list) or len(data) == 0:
+            return t, {}
+        item = data[0]
+        peg_raw  = sf(item.get("priceEarningsGrowthRatioTTM"))
+        roic_raw = sf(item.get("returnOnInvestedCapitalTTM"))
+        roe_raw  = sf(item.get("returnOnEquityTTM"))
+        om_raw   = sf(item.get("operatingProfitMarginTTM"))
+        ic_raw   = sf(item.get("interestCoverageTTM"))
+        de_raw   = sf(item.get("debtEquityRatioTTM"))
+        fpe_raw  = sf(item.get("priceToEarningsRatioTTM"))
+        return t, {
+            "peg":          peg_raw if (peg_raw and 0 < peg_raw <= 500) else None,
+            "peg_src":      "FMP" if (peg_raw and 0 < peg_raw <= 500) else None,
+            "roic":         normalise_pct(roic_raw),
+            "roe":          normalise_pct(roe_raw),
+            "op_margin":    normalise_pct(om_raw),
+            "int_coverage": min(float(ic_raw), 100.0) if (ic_raw and ic_raw > 0) else None,
+            "debt_eq":      de_raw,
+            "fwd_pe":       fpe_raw if (fpe_raw and 0 < fpe_raw <= 10000) else None,
+        }
 
-            price  = _sf(pd_data.get("lastPrice"))
-            hi52   = _sf(pd_data.get("weekHighLow", {}).get("max"))
-            lo52   = _sf(pd_data.get("weekHighLow", {}).get("min"))
-            pe     = _sf(pd_data.get("pdSymbolPe"))
-            mc_cr  = _sf(meta.get("marketCap") or sec_info.get("marketCap"))
-            mc_raw = mc_cr * 1e7 if mc_cr else None  # NSE gives MC in Cr
-
-            return symbol_ns, {
-                "price": price,
-                "hi52":  hi52,
-                "lo52":  lo52,
-                "pe":    pe if (pe and 0 < pe <= 10000) else None,
-                "mc":    mc_raw,
-            }
-        except Exception:
-            return symbol_ns, {}
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(fetch_one_nse, t): t for t in tl}
-        for fut in concurrent.futures.as_completed(futures):
-            try:
-                t, d = fut.result()
-                out[t] = d
-            except Exception:
-                t = futures[fut]
-                out[t] = {}
-        time.sleep(0.1)
-
-    return out
-
-
-# ── Yahoo Session (secondary — forward metrics) ───────────────────────────────
-def _get_yahoo_session(symbol):
-    """Yahoo ticker with browser session — used as secondary source only."""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection":      "keep-alive",
-    })
-    adapter = HTTPAdapter(max_retries=Retry(total=3, backoff_factor=2))
-    session.mount("https://", adapter)
-    return yf.Ticker(symbol, session=session)
-
-
-def _sf(val):
-    try:
-        return float(val) if val is not None else None
-    except Exception:
-        return None
-
-
-# ── Yahoo fundamentals (secondary — fwd PE, PEG, ROE, margins) ───────────────
-def _fetch_yahoo_secondary_one(t):
-    """
-    Fetch ONLY the fields NSE does not provide:
-    Forward PE, PEG, ROE, Op Margin, Debt/Eq, EPS growth,
-    Earn Traj, Int Coverage, ROIC
-    """
-    result = {
-        "fwd_pe": None, "peg": None, "peg_src": None,
-        "roe": None, "roic": None, "op_margin": None,
-        "debt_eq": None, "eps_growth": None,
-        "int_coverage": None, "earn_traj": None,
-    }
-    try:
-        obj  = _get_yahoo_session(t)
-        info = {}
-
-        # 3 retries with longer backoff — Yahoo is rate-limited on cloud
-        for attempt in range(3):
-            try:
-                info = obj.info or {}
-                if (info.get("forwardPE") or info.get("returnOnEquity")
-                        or info.get("pegRatio") or info.get("operatingMargins")):
-                    break
-                time.sleep(3.0 + attempt * 2.0)
-            except Exception:
-                time.sleep(3.0 + attempt * 2.0)
-
-        if not info:
-            return t, result
-
-        px    = _sf(info.get("currentPrice") or info.get("regularMarketPrice"))
-
-        # Fwd PE
-        f_pe  = _sf(info.get("forwardPE"))
-        f_eps = _sf(info.get("forwardEps"))
-        t_eps = _sf(info.get("trailingEps"))
-        if f_pe and 0 < f_pe <= 10_000:
-            result["fwd_pe"] = f_pe
-        elif f_eps and f_eps > 0 and px and px > 0:
-            result["fwd_pe"] = px / f_eps
-
-        # PEG
-        peg_y = _sf(info.get("pegRatio"))
-        if peg_y and 0 < peg_y <= 500:
-            result["peg"]     = peg_y
-            result["peg_src"] = "Yahoo"
-
-        # ROE
-        roe_y = _sf(info.get("returnOnEquity"))
-        if roe_y is not None:
-            result["roe"] = roe_y * 100.0
-
-        # Op Margin
-        om_y = _sf(info.get("operatingMargins"))
-        if om_y is not None:
-            result["op_margin"] = om_y * 100.0
-
-        # Debt/Equity
-        de_y = _sf(info.get("debtToEquity"))
-        if de_y is not None:
-            result["debt_eq"] = de_y / 100.0
-
-        # EPS Growth
-        eg_y = _sf(info.get("earningsGrowth"))
-        if eg_y is not None:
-            result["eps_growth"] = eg_y * 100.0
-
-        # Earn Trajectory
-        if (f_eps is not None and t_eps is not None and abs(t_eps) > 0.01):
-            raw = (f_eps - t_eps) / abs(t_eps)
-            result["earn_traj"] = max(-1.0, min(1.0, raw))
-
-        # Interest Coverage from quarterly_financials
-        try:
-            qfin = obj.quarterly_financials
-            if qfin is not None and not qfin.empty:
-                ebit_row = next((nm for nm in ["EBIT","Operating Income","Ebit"]
-                                 if nm in qfin.index), None)
-                int_row  = next((nm for nm in ["Interest Expense",
-                                               "Interest Expense Non Operating",
-                                               "Net Interest Income"]
-                                 if nm in qfin.index), None)
-                if ebit_row and int_row:
-                    ebit_ttm = qfin.loc[ebit_row].dropna().head(4).sum()
-                    int_ttm  = abs(qfin.loc[int_row].dropna().head(4).sum())
-                    if int_ttm > 0 and ebit_ttm > 0:
-                        result["int_coverage"] = min(float(ebit_ttm/int_ttm), 100.0)
-        except Exception:
-            pass
-
-        # ROIC from financials + balance_sheet
-        try:
-            qfin = obj.quarterly_financials
-            bs   = obj.quarterly_balance_sheet
-            if (qfin is not None and not qfin.empty
-                    and bs is not None and not bs.empty):
-                op_inc_row = next((nm for nm in ["Operating Income","EBIT","Ebit"]
-                                   if nm in qfin.index), None)
-                tax_row    = next((nm for nm in ["Tax Provision","Income Tax Expense","Tax Expense"]
-                                   if nm in qfin.index), None)
-                pretax_row = next((nm for nm in ["Pretax Income","Income Before Tax","EBT"]
-                                   if nm in qfin.index), None)
-                if op_inc_row:
-                    op_inc_ttm   = float(qfin.loc[op_inc_row].dropna().head(4).sum())
-                    eff_tax_rate = 0.25
-                    if tax_row and pretax_row:
-                        tax_ttm    = float(qfin.loc[tax_row].dropna().head(4).sum())
-                        pretax_ttm = float(qfin.loc[pretax_row].dropna().head(4).sum())
-                        if pretax_ttm > 0 and tax_ttm >= 0:
-                            cr = tax_ttm / pretax_ttm
-                            if 0 < cr < 0.6:
-                                eff_tax_rate = cr
-                    nopat      = op_inc_ttm * (1 - eff_tax_rate)
-                    equity_val = next(
-                        (float(bs.loc[nm].dropna().iloc[0])
-                         for nm in ["Total Stockholders Equity","Stockholders Equity",
-                                    "Common Stock Equity",
-                                    "Total Equity Gross Minority Interest"]
-                         if nm in bs.index and len(bs.loc[nm].dropna()) > 0), None)
-                    debt_val   = next(
-                        (float(bs.loc[nm].dropna().iloc[0])
-                         for nm in ["Total Debt","Net Debt","Long Term Debt",
-                                    "Long Term Debt And Capital Lease Obligation"]
-                         if nm in bs.index and len(bs.loc[nm].dropna()) > 0), None)
-                    cash_val   = next(
-                        (float(bs.loc[nm].dropna().iloc[0])
-                         for nm in ["Cash And Cash Equivalents",
-                                    "Cash Cash Equivalents And Short Term Investments",
-                                    "Cash Financial","Cash And Short Term Investments"]
-                         if nm in bs.index and len(bs.loc[nm].dropna()) > 0), None)
-                    if equity_val is not None and debt_val is not None:
-                        ic   = equity_val + debt_val - (cash_val or 0)
-                        if ic > 0 and nopat != 0:
-                            rv = (nopat / ic) * 100.0
-                            if -100 < rv < 200:
-                                result["roic"] = rv
-        except Exception:
-            pass
-
-    except Exception:
-        pass
-    return t, result
-
-
-@st.cache_data(ttl=86400)
-def fetch_yahoo_secondary_all(tickers):
-    """
-    Fetch secondary Yahoo data for all tickers.
-    Intentionally slower — 3 workers, longer sleep to reduce rate limit hits.
-    """
-    tl     = list(tickers)
-    out    = {}
-    CHUNK  = 5     # very small chunks — Yahoo is aggressive on cloud
-    WKRS   = 3
-    SLEEP  = 4.0   # longer sleep between chunks
+    CHUNK = 10; SLEEP = 1.0
     chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
-    progress = st.progress(0)
-    status   = st.empty()
-    total    = len(chunks)
-
+    prog   = st.progress(0)
+    stat   = st.empty()
     for ci, chunk in enumerate(chunks):
-        status.text("Yahoo secondary data: {}/{} ({} of {} tickers)...".format(
-            ci+1, total, ci*CHUNK, len(tl)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
-            futures = {ex.submit(_fetch_yahoo_secondary_one, t): t for t in chunk}
-            for fut in concurrent.futures.as_completed(futures):
-                try:
-                    t, d = fut.result()
-                    out[t] = d
-                except Exception:
-                    out[futures[fut]] = {}
-        progress.progress((ci+1)/total)
+        stat.text("FMP ratios: {}/{} tickers...".format(ci*CHUNK, len(tl)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            for t, d in ex.map(one, chunk):
+                out[t] = d
+        prog.progress((ci+1)/len(chunks))
         if ci < len(chunks)-1:
-            time.sleep(SLEEP + random.uniform(0, 2.0))
-
-    progress.empty()
-    status.empty()
+            time.sleep(SLEEP)
+    prog.empty(); stat.empty()
     return out
 
 
-# ── Momentum (yfinance batch download — less rate-limited than .info) ─────────
+# ── FMP Income Statement (EPS, Earn Traj, Revenue) ───────────────────────────
+@st.cache_data(ttl=86400)
+def fetch_fmp_income(tickers, api_key):
+    """
+    FMP /income-statement/{symbol}?period=quarter&limit=5
+    Provides: revenue (4Q), EPS (trailing + forward proxy), earn traj
+    """
+    out = {}
+    tl  = list(tickers)
+
+    def one(t):
+        data = fmp_get(
+            "income-statement/{}".format(t), api_key,
+            params={"period": "quarter", "limit": "5"}
+        )
+        if not data or not isinstance(data, list) or len(data) == 0:
+            return t, {}
+        # Most recent 4 quarters for revenue
+        rev4 = []
+        for q in data[:4]:
+            rev4.append(sf(q.get("revenue")))
+        # EPS trajectory: compare most recent vs one year ago
+        eps_recent = sf(data[0].get("eps")) if len(data) > 0 else None
+        eps_old    = sf(data[3].get("eps")) if len(data) >= 4 else None
+        earn_traj  = None
+        if eps_recent is not None and eps_old is not None and abs(eps_old) > 0.01:
+            raw       = (eps_recent - eps_old) / abs(eps_old)
+            earn_traj = max(-1.0, min(1.0, raw))
+        # EPS growth YoY
+        eps_growth = None
+        if eps_recent is not None and eps_old is not None and abs(eps_old) > 0.01:
+            eps_growth = (eps_recent - eps_old) / abs(eps_old) * 100.0
+        return t, {
+            "rev4":       rev4 if len(rev4) == 4 else [None]*4,
+            "earn_traj":  earn_traj,
+            "eps_growth": eps_growth,
+        }
+
+    CHUNK = 10; SLEEP = 1.0
+    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+    prog   = st.progress(0)
+    stat   = st.empty()
+    for ci, chunk in enumerate(chunks):
+        stat.text("FMP income statements: {}/{} tickers...".format(ci*CHUNK, len(tl)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            for t, d in ex.map(one, chunk):
+                out[t] = d
+        prog.progress((ci+1)/len(chunks))
+        if ci < len(chunks)-1:
+            time.sleep(SLEEP)
+    prog.empty(); stat.empty()
+    return out
+
+
+# ── FMP Balance Sheet (ROIC if not in ratios) ────────────────────────────────
+@st.cache_data(ttl=86400)
+def fetch_fmp_balance_sheet(tickers, api_key):
+    """
+    FMP /balance-sheet-statement/{symbol}?period=quarter&limit=4
+    Used only for ROIC computation fallback.
+    """
+    out = {}
+    tl  = list(tickers)
+
+    def one(t):
+        data = fmp_get(
+            "balance-sheet-statement/{}".format(t), api_key,
+            params={"period": "quarter", "limit": "4"}
+        )
+        if not data or not isinstance(data, list) or len(data) == 0:
+            return t, {}
+        latest = data[0]
+        return t, {
+            "total_equity": sf(latest.get("totalStockholdersEquity")
+                               or latest.get("totalEquity")),
+            "total_debt":   sf(latest.get("totalDebt")
+                               or latest.get("longTermDebt")),
+            "cash":         sf(latest.get("cashAndCashEquivalents")
+                               or latest.get("cashAndShortTermInvestments")),
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        for t, d in ex.map(one, tl):
+            out[t] = d
+    return out
+
+
+# ── Momentum (yfinance batch — price history only, not blocked) ───────────────
 @st.cache_data(ttl=3600)
 def fetch_momentum_batch(tickers):
     tl  = list(tickers)
@@ -533,19 +439,19 @@ def fetch_momentum_batch(tickers):
                             progress=False, threads=True)
         for t in tl:
             try:
-                closes_m = (raw_m["Close"].dropna() if len(tl)==1
+                closes_m = (raw_m["Close"].dropna() if len(tl) == 1
                             else raw_m[t]["Close"].dropna())
-                closes_d = (raw_d["Close"].dropna() if len(tl)==1
+                closes_d = (raw_d["Close"].dropna() if len(tl) == 1
                             else raw_d[t]["Close"].dropna())
                 if len(closes_m) < 2:
                     continue
                 px_now = float(closes_m.iloc[-1])
 
                 def ret_mo(n):
-                    idx = -(n+1)
+                    idx = -(n + 1)
                     if abs(idx) > len(closes_m): return None
                     px = float(closes_m.iloc[idx])
-                    return (px_now/px - 1)*100.0 if px > 0 else None
+                    return (px_now / px - 1) * 100.0 if px > 0 else None
 
                 r1 = ret_mo(1); r3 = ret_mo(3); r6 = ret_mo(6)
                 trailing_vol = None
@@ -553,14 +459,12 @@ def fetch_momentum_batch(tickers):
                     dr = closes_d.pct_change().dropna().tail(90)
                     if len(dr) >= 15:
                         trailing_vol = float(dr.std() * np.sqrt(252) * 100.0)
-
                 skip = (r6-r1) if (r6 is not None and r1 is not None) else None
                 mom  = None
                 if skip is not None and trailing_vol and trailing_vol > 0:
                     mom = skip / trailing_vol
                 elif skip is not None:
                     mom = skip
-
                 out[t] = {"ret_1mo": r1, "ret_3mo": r3, "ret_6mo": r6,
                           "trailing_vol": trailing_vol, "momentum_score": mom}
             except Exception:
@@ -568,69 +472,6 @@ def fetch_momentum_batch(tickers):
     except Exception:
         pass
     return out
-
-
-# ── Revenue ───────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=86400)
-def fetch_last4_revenue_parallel(tickers):
-    tl  = list(tickers)
-    out = {}
-
-    def one(t):
-        try:
-            obj = _get_yahoo_session(t)
-            qf  = obj.quarterly_financials
-            if qf is not None and "Total Revenue" in qf.index:
-                s = qf.loc["Total Revenue"].sort_index().tail(4)
-                v = [float(x) for x in s.values]
-                if len(v) == 4:
-                    return t, v
-        except Exception:
-            pass
-        return t, [None, None, None, None]
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-        for t, v in ex.map(one, tl):
-            out[t] = v
-    return out
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def to_num(x):
-    return pd.to_numeric(x, errors="coerce")
-
-def fmt_mc_inr(val):
-    if pd.isna(val) or val == 0: return "N/A"
-    cr = val / 1e7
-    if cr >= 100000: return "₹{:.2f}L Cr".format(cr/100000)
-    return "₹{:.0f}Cr".format(cr)
-
-def percentile_score(series: pd.Series, ascending=True) -> pd.Series:
-    result = pd.Series(index=series.index, dtype=float)
-    valid  = series.notna()
-    if valid.sum() == 0: return result.fillna(0.0)
-    ranked = series[valid].rank(method="average", ascending=ascending)
-    n      = valid.sum()
-    result[valid]  = (ranked-1)/(n-1)*100.0 if n > 1 else 50.0
-    result[~valid] = 0.0
-    return result
-
-def missing_factor_penalty(row, factor_cols):
-    missing = sum(1 for c in factor_cols if pd.isna(row.get(c)))
-    if missing >= 3: return 0.70
-    if missing == 2: return 0.85
-    return 1.0
-
-def revenue_growth_pct_cagr(rev4):
-    try:
-        if rev4 is None or len(rev4) != 4: return None
-        q1,_,_,q4 = rev4
-        if q1 is None or q4 is None: return None
-        q1, q4 = float(q1), float(q4)
-        if q1 <= 0 or q4 <= 0: return None
-        return ((q4/q1)**(1/3)-1)*100.0
-    except Exception:
-        return None
 
 
 # ── Quality Score ─────────────────────────────────────────────────────────────
@@ -646,7 +487,7 @@ def compute_quality_score(roic, roe, int_coverage, op_margin):
                   if int_coverage is not None and not pd.isna(int_coverage) else 0.0)
     scores.append(min(100.0, max(0.0, float(op_margin)/40.0*100.0))
                   if op_margin is not None and not pd.isna(op_margin) else 0.0)
-    return sum(scores)/3.0
+    return sum(scores) / 3.0
 
 
 # ── Quality flag ──────────────────────────────────────────────────────────────
@@ -670,7 +511,7 @@ def compute_rank_by_sector(scr):
     scr["Rank"]  = pd.NA
     W = FACTOR_WEIGHTS
     for sector in scr["Sector"].dropna().unique():
-        elig = scr[(scr["Sector"]==sector) & scr["Eligible"]].copy()
+        elig = scr[(scr["Sector"] == sector) & scr["Eligible"]].copy()
         if elig.empty: continue
         pe_input         = elig["Fwd P/E"].fillna(elig["P/E"])
         elig["_s_val"]   = percentile_score(pe_input,               ascending=True)
@@ -700,7 +541,8 @@ def compute_conviction_scores(scr):
     KEY = ["P/E","Fwd P/E","PEG","Quality Score","Momentum Score","Earn Traj"]
     scr = scr.copy()
     scr["_comp"] = scr.apply(
-        lambda r: sum(1 for c in KEY if c in r.index and pd.notna(r[c]))/len(KEY), axis=1)
+        lambda r: sum(1 for c in KEY if c in r.index and pd.notna(r[c]))/len(KEY),
+        axis=1)
     med_pe  = scr["P/E"].median()
     sec_map = scr.groupby("Sector")["P/E"].median()
     def sec_disc(s):
@@ -717,51 +559,52 @@ def compute_conviction_scores(scr):
 
 
 # ── Build table ───────────────────────────────────────────────────────────────
-def build_screener_table(universe_df, nse_quotes, yahoo_secondary,
-                         revenue_map, momentum_map):
+def build_screener_table(universe_df, fmp_quotes, fmp_ratios,
+                         fmp_income, momentum_map):
     rows = []
     for _, r in universe_df.iterrows():
         t   = r["Ticker"]
         sec = r["Sector"]
 
-        nq  = nse_quotes.get(t, {})
-        yq  = yahoo_secondary.get(t, {})
+        fq  = fmp_quotes.get(t, {})
+        fr  = fmp_ratios.get(t, {})
+        fi  = fmp_income.get(t, {})
 
-        price     = to_num(nq.get("price"))
-        mc        = to_num(nq.get("mc"))
-        pe        = to_num(nq.get("pe"))        # NSE trailing PE
-        hi        = to_num(nq.get("hi52"))
-        lo        = to_num(nq.get("lo52"))
-        fwd       = to_num(yq.get("fwd_pe"))    # Yahoo forward PE
-        roic      = to_num(yq.get("roic"))
-        roe       = to_num(yq.get("roe"))
-        ic        = to_num(yq.get("int_coverage"))
-        om        = to_num(yq.get("op_margin"))
-        de        = to_num(yq.get("debt_eq"))
-        earn_traj = to_num(yq.get("earn_traj"))
+        price     = to_num(fq.get("price"))
+        mc        = to_num(fq.get("mc"))
+        pe        = to_num(fq.get("pe"))
+        hi        = to_num(fq.get("hi52"))
+        lo        = to_num(fq.get("lo52"))
+        fwd       = to_num(fr.get("fwd_pe"))
+        roic      = to_num(fr.get("roic"))
+        roe       = to_num(fr.get("roe"))
+        ic        = to_num(fr.get("int_coverage"))
+        om        = to_num(fr.get("op_margin"))
+        de        = to_num(fr.get("debt_eq"))
+        earn_traj = to_num(fi.get("earn_traj"))
+        eps_g     = fi.get("eps_growth")
 
         pos52 = None
         if pd.notna(price) and pd.notna(hi) and pd.notna(lo) and hi != lo:
             pos52 = float((price-lo)/(hi-lo)*100.0)
 
-        rev4                = revenue_map.get(t, [None]*4)
+        rev4                = fi.get("rev4", [None]*4)
         rq1,rq2,rq3,rq4    = [to_num(x) for x in rev4]
         growth              = revenue_growth_pct_cagr([rq1,rq2,rq3,rq4])
 
         # PEG
-        peg_direct = to_num(yq.get("peg"))
+        peg_direct = to_num(fr.get("peg"))
         peg = None; peg_method = "—"
         if pd.notna(peg_direct):
             peg        = float(peg_direct)
-            peg_method = yq.get("peg_src") or "Yahoo"
+            peg_method = "FMP"
         else:
             pe_for_peg = fwd if pd.notna(fwd) else pe
-            eps_g      = yq.get("eps_growth")
             if eps_g is not None:
                 eg = float(eps_g)
                 if eg >= MIN_GROWTH_PCT_FOR_PEG and pd.notna(pe_for_peg):
-                    peg        = float(pe_for_peg)/eg
-                    peg_method = "Yahoo EPS growth"
+                    peg        = float(pe_for_peg) / eg
+                    peg_method = "FMP EPS growth"
         if peg is not None and (peg <= 0 or peg > 500):
             peg = None
 
@@ -844,13 +687,13 @@ def render_sector_kpi_panel(scr, sector_sel):
                 "<div style='color:#666;font-size:10px;margin-top:3px;'>{}</div>"
                 "</div>").format(label,color,value,sub)
 
-    is_all   = (sector_sel=="All Sectors")
+    is_all   = (sector_sel == "All Sectors")
     label    = "All Sectors (Nifty 50)" if is_all else sector_sel
     total_mc = scr["Mkt Cap Raw"].sum()
     sdata    = scr.copy() if is_all else scr[scr["Sector"]==sector_sel]
     sec_mc   = sdata["Mkt Cap Raw"].sum()
-    pct      = (100.0 if is_all else (sec_mc/total_mc*100.0 if total_mc > 0 else 0.0))
-
+    pct      = (100.0 if is_all
+                else (sec_mc/total_mc*100.0 if total_mc > 0 else 0.0))
     med_pe   = sdata["P/E"].median()
     med_fwd  = sdata["Fwd P/E"].median()
     med_qual = sdata["Quality Score"].median()
@@ -864,8 +707,8 @@ def render_sector_kpi_panel(scr, sector_sel):
         "</div>".format(label), unsafe_allow_html=True)
 
     c1,c2,c3,c4,c5,c6 = st.columns(6)
-    c1.markdown(_kpi("Sector Mkt Cap",   fmt_mc_inr(sec_mc),  "sector total"),          unsafe_allow_html=True)
-    c2.markdown(_kpi("Nifty 50 Mkt Cap", fmt_mc_inr(total_mc),"all 50 stocks"),         unsafe_allow_html=True)
+    c1.markdown(_kpi("Sector Mkt Cap",   fmt_mc_inr(sec_mc),  "sector total"),         unsafe_allow_html=True)
+    c2.markdown(_kpi("Nifty 50 Mkt Cap", fmt_mc_inr(total_mc),"all 50 stocks"),        unsafe_allow_html=True)
     c3.markdown(_kpi("Sector Share",     "{:.1f}%".format(pct),"{} stocks".format(len(sdata))), unsafe_allow_html=True)
     c4.markdown(_kpi("Median P/E → Fwd",
                      "{:.1f}→{:.1f}".format(med_pe,med_fwd)
@@ -911,10 +754,7 @@ st.markdown(
     unsafe_allow_html=True)
 
 st.markdown("## 🇮🇳 Nifty 50 Fundamental Screener")
-st.caption(
-    "NSE API (price/PE/MC) · Yahoo Finance secondary (Fwd PE/PEG/ROE) · "
-    "Wikipedia universe · 5-factor scoring · INR"
-)
+st.caption("FMP API · Wikipedia universe · 5-factor scoring · INR")
 
 page_screener, page_about, page_debug = st.tabs(["📊 Screener","📖 About","🔧 Debug"])
 
@@ -922,61 +762,77 @@ page_screener, page_about, page_debug = st.tabs(["📊 Screener","📖 About","�
 # PAGE 1 — SCREENER
 # ══════════════════════════════════════════════════════════════════════════════
 with page_screener:
+    fmp_key = get_fmp_key()
+    if not fmp_key:
+        st.error("❌ FMP API key not configured. Add [fmp] api_key to Streamlit Secrets.")
+        st.markdown("""
+        **How to add your FMP key:**
+        1. Get a free key at [financialmodelingprep.com](https://financialmodelingprep.com)
+        2. In Streamlit Cloud → your app → **Settings** → **Secrets**
+        3. Add:
+        ```toml
+        [fmp]
+        api_key = "your_key_here"
+        ```
+        4. Save — app restarts automatically
+        """)
+        st.stop()
+
     col_r, col_t = st.columns([1,6])
     with col_r:
         if st.button("🔄 Refresh"):
             st.cache_data.clear()
-            st.cache_resource.clear()
             st.rerun()
     with col_t:
         st.caption("Last loaded: {} · Prices: 1hr · Fundamentals: 24hr".format(
             datetime.now().strftime("%I:%M %p")))
 
-    with st.spinner("Loading universe..."):
+    with st.spinner("Loading universe from Wikipedia..."):
         universe_df = get_nifty50_universe()
     tickers = tuple(universe_df["Ticker"].tolist())
 
-    with st.spinner("Fetching NSE quotes (price, PE, MC, 52W)..."):
-        nse_quotes = fetch_nse_quotes(tickers)
+    with st.spinner("Fetching FMP quotes (price, PE, MC, 52W)..."):
+        fmp_quotes = fetch_fmp_quotes(tickers, fmp_key)
 
-    with st.spinner("Fetching momentum data..."):
+    with st.spinner("Fetching FMP ratios (ROE, margins, ROIC, PEG)..."):
+        fmp_ratios = fetch_fmp_ratios(tickers, fmp_key)
+
+    with st.spinner("Fetching FMP income statements (EPS, revenue)..."):
+        fmp_income = fetch_fmp_income(tickers, fmp_key)
+
+    with st.spinner("Fetching momentum (price history)..."):
         momentum = fetch_momentum_batch(tickers)
 
-    with st.spinner("Fetching Yahoo secondary data (Fwd PE, PEG, ROE — ~3 min)..."):
-        yahoo_secondary = fetch_yahoo_secondary_all(tickers)
-
-    with st.spinner("Fetching quarterly revenue..."):
-        rev_map = fetch_last4_revenue_parallel(tickers)
-
     # Coverage banner
-    total_t  = len(tickers)
-    has_price = sum(1 for t in tickers if nse_quotes.get(t,{}).get("price") is not None)
-    has_pe    = sum(1 for t in tickers if nse_quotes.get(t,{}).get("pe")    is not None)
-    has_fwd   = sum(1 for t in tickers if yahoo_secondary.get(t,{}).get("fwd_pe")    is not None)
-    has_peg   = sum(1 for t in tickers if yahoo_secondary.get(t,{}).get("peg")       is not None)
-    has_roe   = sum(1 for t in tickers if yahoo_secondary.get(t,{}).get("roe")       is not None)
-    has_et    = sum(1 for t in tickers if yahoo_secondary.get(t,{}).get("earn_traj") is not None)
+    total_t   = len(tickers)
+    has_price = sum(1 for t in tickers if fmp_quotes.get(t,{}).get("price") is not None)
+    has_pe    = sum(1 for t in tickers if fmp_quotes.get(t,{}).get("pe")    is not None)
+    has_fwd   = sum(1 for t in tickers if fmp_ratios.get(t,{}).get("fwd_pe")    is not None)
+    has_roe   = sum(1 for t in tickers if fmp_ratios.get(t,{}).get("roe")       is not None)
+    has_roic  = sum(1 for t in tickers if fmp_ratios.get(t,{}).get("roic")      is not None)
+    has_et    = sum(1 for t in tickers if fmp_income.get(t,{}).get("earn_traj") is not None)
 
     st.info(
         "Data coverage — "
-        "Price: {}/{} ({:.0f}%) [NSE] · "
-        "P/E: {}/{} ({:.0f}%) [NSE] · "
-        "Fwd P/E: {}/{} ({:.0f}%) [Yahoo] · "
-        "PEG: {}/{} ({:.0f}%) [Yahoo] · "
-        "ROE: {}/{} ({:.0f}%) [Yahoo] · "
-        "Earn Traj: {}/{} ({:.0f}%) [Yahoo]".format(
+        "Price: {}/{} ({:.0f}%) · "
+        "P/E: {}/{} ({:.0f}%) · "
+        "Fwd P/E: {}/{} ({:.0f}%) · "
+        "ROE: {}/{} ({:.0f}%) · "
+        "ROIC: {}/{} ({:.0f}%) · "
+        "Earn Traj: {}/{} ({:.0f}%) · "
+        "Source: FMP API".format(
             has_price, total_t, has_price/total_t*100,
             has_pe,    total_t, has_pe   /total_t*100,
             has_fwd,   total_t, has_fwd  /total_t*100,
-            has_peg,   total_t, has_peg  /total_t*100,
             has_roe,   total_t, has_roe  /total_t*100,
+            has_roic,  total_t, has_roic /total_t*100,
             has_et,    total_t, has_et   /total_t*100,
         )
     )
 
     with st.spinner("Building screener table..."):
         scr = build_screener_table(
-            universe_df, nse_quotes, yahoo_secondary, rev_map, momentum)
+            universe_df, fmp_quotes, fmp_ratios, fmp_income, momentum)
 
     # Filters
     st.markdown("### Filters")
@@ -1087,7 +943,7 @@ with page_screener:
     st.markdown("""
 **PEG:** < 1.0 = potentially undervalued. Only computed when EPS growth ≥ 5%.
 
-**Earn Traj:** (Forward EPS − Trailing EPS) / |Trailing EPS|. Range −1.0 to +1.0.
+**Earn Traj:** Year-over-year EPS change from FMP quarterly income statements. Range −1.0 to +1.0.
 
 **MC% of Nifty50:** This stock's share of total Nifty 50 market cap.
 """)
@@ -1096,22 +952,21 @@ with page_screener:
 # PAGE 2 — ABOUT
 # ══════════════════════════════════════════════════════════════════════════════
 with page_about:
-    st.markdown("## About — Nifty 50 Screener v3")
+    st.markdown("## About — Nifty 50 Screener v4")
     st.markdown("""
 ### Data Architecture
-| Field | Source |
-|-------|--------|
-| Price, 52W High/Low, Trailing P/E, Market Cap | **NSE India API** (primary) |
-| Forward P/E, PEG, ROE, Op Margin, EPS Growth, Earn Traj | **Yahoo Finance** (secondary) |
-| ROIC, Interest Coverage | **Yahoo Finance** quarterly financials |
-| Momentum (1/3/6mo returns, vol) | **Yahoo Finance** batch price download |
-| Revenue (quarterly) | **Yahoo Finance** quarterly financials |
-| Universe (50 stocks + sectors) | **NSE Index API** → Wikipedia fallback |
+| Field | Source | Endpoint |
+|-------|--------|----------|
+| Price, MC, 52W, Trailing P/E | **FMP** | `/quote/{symbol}` |
+| Fwd P/E, PEG, ROE, Op Margin, D/E, Int Coverage, ROIC | **FMP** | `/ratios-ttm/{symbol}` |
+| EPS, Revenue (quarterly), Earn Traj | **FMP** | `/income-statement/{symbol}?period=quarter` |
+| Momentum (price returns, volatility) | **yfinance batch** | price history download |
+| Universe | **Wikipedia** | NIFTY_50 page |
 
-### Why Two Sources?
-Streamlit Cloud IPs are rate-limited by Yahoo Finance for `.info` calls.
-NSE India API is official, fast, and not rate-limited — used for all real-time data.
-Yahoo Finance is used only for analyst estimates (Fwd PE, PEG) which NSE doesn't provide.
+### Why FMP?
+Yahoo Finance and NSE India API both rate-limit Streamlit Cloud server IPs.
+FMP provides an authenticated API that works from any IP.
+Free tier = 250 calls/day. Nifty 50 screener uses ~150 calls/day total.
 
 ### Scoring Model
 `Valuation 25% + Quality 25% + PEG 20% + Earn Traj 15% + Momentum 15%`
@@ -1122,55 +977,47 @@ Yahoo Finance is used only for analyst estimates (Fwd PE, PEG) which NSE doesn't
 # ══════════════════════════════════════════════════════════════════════════════
 with page_debug:
     st.markdown("## 🔧 Debug")
-
-    test_sym = st.text_input("NSE Symbol (no .NS)", value="RELIANCE")
+    fmp_key_dbg = get_fmp_key()
+    test_sym    = st.text_input("Ticker (with .NS)", value="RELIANCE.NS")
 
     if st.button("▶ Run diagnostic"):
-        with st.spinner("Testing {}...".format(test_sym)):
+        if not fmp_key_dbg:
+            st.error("No FMP key configured in Streamlit Secrets")
+        else:
+            with st.spinner("Testing {}...".format(test_sym)):
 
-            st.markdown("### NSE Quote API")
-            try:
-                d = nse_get("quote-equity", {"symbol": test_sym})
-                if d:
-                    pi = d.get("priceInfo", {})
-                    st.success("✅ NSE API working")
-                    st.json({
-                        "lastPrice":  pi.get("lastPrice"),
-                        "pe":         pi.get("pdSymbolPe"),
-                        "52W_high":   pi.get("weekHighLow",{}).get("max"),
-                        "52W_low":    pi.get("weekHighLow",{}).get("min"),
-                        "marketCap":  d.get("metadata",{}).get("marketCap"),
-                    })
+                st.markdown("### FMP /quote")
+                d = fmp_get("quote/{}".format(test_sym), fmp_key_dbg)
+                if d and isinstance(d, list) and len(d) > 0:
+                    st.success("✅ FMP quote working")
+                    item = d[0]
+                    st.json({k: item.get(k) for k in
+                             ["price","pe","marketCap","yearHigh","yearLow","name"]})
                 else:
-                    st.error("❌ NSE API returned empty — session cookie may have expired")
-            except Exception as e:
-                st.error("NSE API failed: {}".format(e))
+                    st.error("❌ FMP quote returned empty — check API key or ticker format")
 
-            st.markdown("### Yahoo Finance (.info)")
-            try:
-                obj  = _get_yahoo_session(test_sym+".NS")
-                info = obj.info or {}
-                if info and (info.get("forwardPE") or info.get("returnOnEquity")):
-                    st.success("✅ Yahoo .info working")
-                    st.json({k: info.get(k) for k in [
-                        "forwardPE","pegRatio","returnOnEquity",
-                        "operatingMargins","earningsGrowth",
-                        "forwardEps","trailingEps",
+                st.markdown("### FMP /ratios-ttm")
+                d = fmp_get("ratios-ttm/{}".format(test_sym), fmp_key_dbg)
+                if d and isinstance(d, list) and len(d) > 0:
+                    st.success("✅ FMP ratios working")
+                    item = d[0]
+                    st.json({k: item.get(k) for k in [
+                        "returnOnEquityTTM","returnOnInvestedCapitalTTM",
+                        "operatingProfitMarginTTM","interestCoverageTTM",
+                        "priceEarningsGrowthRatioTTM","priceToEarningsRatioTTM",
                     ]})
                 else:
-                    st.warning("⚠️ Yahoo .info empty or rate-limited — NSE covers price/PE so this is OK")
-            except Exception as e:
-                st.warning("Yahoo .info: {} (non-critical — NSE is primary)".format(e))
+                    st.error("❌ FMP ratios-ttm empty — may need paid tier")
 
-            st.markdown("### NSE Universe API")
-            try:
-                d = nse_get("equity-stockIndices", {"index": "NIFTY 50"})
-                if d and "data" in d:
-                    st.success("✅ NSE universe API: {} stocks".format(len(d["data"])))
+                st.markdown("### FMP /income-statement (quarterly)")
+                d = fmp_get("income-statement/{}".format(test_sym), fmp_key_dbg,
+                            params={"period":"quarter","limit":"4"})
+                if d and isinstance(d, list) and len(d) > 0:
+                    st.success("✅ FMP income statement working — {} quarters".format(len(d)))
+                    st.json({k: d[0].get(k) for k in
+                             ["date","revenue","eps","netIncome"]})
                 else:
-                    st.error("❌ NSE universe API failed")
-            except Exception as e:
-                st.error("NSE universe: {}".format(e))
+                    st.error("❌ FMP income statement empty")
 
-            st.markdown("### yfinance version")
-            st.code(yf.__version__)
+                st.markdown("### yfinance version")
+                st.code(yf.__version__)
