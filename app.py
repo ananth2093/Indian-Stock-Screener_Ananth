@@ -1,11 +1,12 @@
-# screener_app_nifty50.py  v2
+# app.py  (Nifty 50 Screener v2 — standalone, Streamlit Cloud fixed)
 # ─────────────────────────────────────────────────────────────────────────────
-# Nifty 50 Fundamental Screener — ported from S&P 500 Screener v8
-#
-# v2 fixes:
-#   1. Removed duplicate get_nifty50_universe() — Wikipedia scraper now active
-#   2. Fixed footnote regex: $.*?$ → $.*?$
-#   3. Added BeautifulSoup import guard
+# Fixes applied:
+#   1. Browser session headers on every Yahoo request (fixes cloud IP blocks)
+#   2. 3-retry backoff on .info (fixes empty dict returns)
+#   3. fast_info as primary source for price/MC/52W
+#   4. Per-ticker fallback in fetch_prices_batch
+#   5. Pinned yfinance==0.2.54 in requirements.txt
+#   6. Debug tab added for live diagnostics
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -19,6 +20,7 @@ import re
 import warnings
 import concurrent.futures
 from datetime import datetime
+from requests.adapters import HTTPAdapter
 
 warnings.filterwarnings("ignore")
 
@@ -45,7 +47,28 @@ QUALITY_THRESHOLDS = {
     "op_margin_min":    5.0,
 }
 
-# ── Universe (Wikipedia scraper — single definition) ──────────────────────────
+# ── Browser session (fixes Streamlit Cloud IP blocks) ─────────────────────────
+def _get_ticker_with_session(symbol):
+    """Create yfinance Ticker with real browser session headers."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection":      "keep-alive",
+    })
+    adapter = HTTPAdapter(max_retries=3)
+    session.mount("https://", adapter)
+    session.mount("http://",  adapter)
+    return yf.Ticker(symbol, session=session)
+
+
+# ── Universe (Wikipedia scraper) ──────────────────────────────────────────────
 @st.cache_data(ttl=86400)
 def get_nifty50_universe():
     """
@@ -108,7 +131,7 @@ def get_nifty50_universe():
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # ── Find the constituents table (4 strategies) ────────────────────
+        # ── Find table (4 strategies) ─────────────────────────────────────
         table = soup.find("table", {"id": "constituents"})
 
         if table is None:
@@ -131,7 +154,7 @@ def get_nifty50_universe():
         if table is None:
             raise RuntimeError("No suitable table found on Wikipedia NIFTY_50 page")
 
-        # ── Detect column positions from headers ──────────────────────────
+        # ── Detect columns ────────────────────────────────────────────────
         header_row = table.find("tr")
         headers    = []
         if header_row:
@@ -140,18 +163,14 @@ def get_nifty50_universe():
 
         ticker_col = None
         sector_col = None
-
         for i, h in enumerate(headers):
             if any(kw in h for kw in ["symbol", "ticker", "nse"]):
                 ticker_col = i
             if any(kw in h for kw in ["sector", "industry", "gics"]):
                 sector_col = i
 
-        # Fallback positions if header detection fails
-        if ticker_col is None:
-            ticker_col = 2
-        if sector_col is None:
-            sector_col = 1
+        if ticker_col is None: ticker_col = 2
+        if sector_col is None: sector_col = 1
 
         # ── Extract rows ──────────────────────────────────────────────────
         data = []
@@ -160,18 +179,15 @@ def get_nifty50_universe():
             if len(cols) <= max(ticker_col, sector_col):
                 continue
 
-            # ✅ Fixed regex — strip Wikipedia footnotes like [a], [1]
             raw_ticker = cols[ticker_col].get_text(strip=True)
             raw_ticker = re.sub(r"$.*?$", "", raw_ticker).strip()
             raw_ticker = re.sub(r"[^A-Za-z0-9&\-]", "", raw_ticker).upper()
-
             if not raw_ticker or len(raw_ticker) < 2:
                 continue
 
             raw_sector = cols[sector_col].get_text(strip=True)
             raw_sector = re.sub(r"$.*?$", "", raw_sector).strip()
 
-            # Map NSE sector → GICS
             gics_sector = SECTOR_MAP.get(raw_sector)
             if gics_sector is None:
                 for nse_name, gics_name in SECTOR_MAP.items():
@@ -180,7 +196,7 @@ def get_nifty50_universe():
                         gics_sector = gics_name
                         break
             if gics_sector is None:
-                gics_sector = raw_sector  # keep original if no mapping
+                gics_sector = raw_sector
 
             data.append({
                 "Ticker":     raw_ticker + ".NS",
@@ -226,12 +242,6 @@ def sf(val):
     except Exception:
         return None
 
-def normalise_pct(val):
-    if val is None:
-        return None
-    v = float(val)
-    return v * 100.0 if abs(v) < 5.0 else v
-
 def fmt_mc_inr(val):
     if pd.isna(val) or val == 0:
         return "N/A"
@@ -272,11 +282,13 @@ def revenue_growth_pct_cagr(rev4):
         return None
 
 
-# ── Prices batch ──────────────────────────────────────────────────────────────
+# ── Prices batch (with per-ticker fallback) ───────────────────────────────────
 @st.cache_data(ttl=3600)
 def fetch_prices_batch(tickers):
     tl  = list(tickers)
-    res = {t: {"price": None, "hi52": None, "lo52": None, "mc": None} for t in tl}
+    res = {t: {"price": None} for t in tl}
+
+    # Try batch download first
     try:
         raw = yf.download(
             tl, period="2d", interval="1d",
@@ -287,11 +299,27 @@ def fetch_prices_batch(tickers):
             try:
                 px = (float(raw["Close"].iloc[-1]) if len(tl) == 1
                       else float(raw[t]["Close"].iloc[-1]))
-                res[t]["price"] = px
+                if px and px > 0:
+                    res[t]["price"] = px
             except Exception:
                 pass
     except Exception:
         pass
+
+    # Per-ticker fallback for any that failed
+    missing = [t for t in tl if res[t]["price"] is None]
+    if missing:
+        for t in missing:
+            try:
+                obj = _get_ticker_with_session(t)
+                fi  = obj.fast_info
+                px  = sf(getattr(fi, "last_price", None))
+                if px and px > 0:
+                    res[t]["price"] = px
+            except Exception:
+                pass
+            time.sleep(0.3)
+
     return res
 
 
@@ -356,26 +384,22 @@ def fetch_momentum_batch(tickers):
     return out
 
 
-# ── Yahoo fundamentals (single ticker) ───────────────────────────────────────
+# ── Yahoo fundamentals (single ticker — with session + retry) ─────────────────
 def _fetch_yahoo_fundamentals_one(t):
     result = {
         "pe": None, "pe_src": None,
         "fwd_pe": None,
         "peg": None, "peg_src": None,
-        "roe": None,
-        "roic": None,
-        "op_margin": None,
-        "debt_eq": None,
-        "eps_growth": None,
-        "int_coverage": None,
+        "roe": None, "roic": None,
+        "op_margin": None, "debt_eq": None,
+        "eps_growth": None, "int_coverage": None,
         "earn_traj": None,
-        "mc": None,
-        "hi52": None,
-        "lo52": None,
+        "mc": None, "hi52": None, "lo52": None,
     }
     try:
-        obj = yf.Ticker(t)
+        obj = _get_ticker_with_session(t)
 
+        # ── fast_info first (most reliable on cloud) ──────────────────────
         try:
             fi = obj.fast_info
             if fi is not None:
@@ -388,18 +412,22 @@ def _fetch_yahoo_fundamentals_one(t):
         except Exception:
             pass
 
+        # ── .info with 3 retries + backoff ────────────────────────────────
         info = {}
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 info = obj.info or {}
-                if info.get("trailingPE") or info.get("pegRatio") or info.get("forwardPE"):
+                if (info.get("trailingPE") or info.get("pegRatio")
+                        or info.get("forwardPE") or info.get("marketCap")
+                        or info.get("returnOnEquity")):
                     break
+                time.sleep(2.0 + attempt * 1.5)
             except Exception:
-                pass
-            time.sleep(0.5 + random.uniform(0, 0.5))
+                time.sleep(2.0 + attempt * 1.5)
 
         px = sf(info.get("currentPrice") or info.get("regularMarketPrice"))
 
+        # PE
         t_pe  = sf(info.get("trailingPE"))
         t_eps = sf(info.get("trailingEps"))
         if t_pe and 0 < t_pe <= 10_000:
@@ -409,6 +437,7 @@ def _fetch_yahoo_fundamentals_one(t):
             result["pe"]     = px / t_eps
             result["pe_src"] = "Yahoo(calc)"
 
+        # Fwd PE
         f_pe  = sf(info.get("forwardPE"))
         f_eps = sf(info.get("forwardEps"))
         if f_pe and 0 < f_pe <= 10_000:
@@ -416,39 +445,47 @@ def _fetch_yahoo_fundamentals_one(t):
         elif f_eps and f_eps > 0 and px and px > 0:
             result["fwd_pe"] = px / f_eps
 
+        # PEG
         peg_y = sf(info.get("pegRatio"))
         if peg_y and 0 < peg_y <= 500:
             result["peg"]     = peg_y
             result["peg_src"] = "Yahoo"
 
+        # ROE
         roe_y = sf(info.get("returnOnEquity"))
         if roe_y is not None:
             result["roe"] = roe_y * 100.0
 
+        # Op Margin
         om_y = sf(info.get("operatingMargins"))
         if om_y is not None:
             result["op_margin"] = om_y * 100.0
 
+        # Debt/Equity
         de_y = sf(info.get("debtToEquity"))
         if de_y is not None:
             result["debt_eq"] = de_y / 100.0
 
+        # EPS Growth
         eg_y = sf(info.get("earningsGrowth"))
         if eg_y is not None:
             result["eps_growth"] = eg_y * 100.0
 
+        # Earn Trajectory
         fwd_eps_val   = sf(info.get("forwardEps"))
         trail_eps_val = sf(info.get("trailingEps"))
         if (fwd_eps_val is not None and trail_eps_val is not None
                 and abs(trail_eps_val) > 0.01):
-            earn_traj_raw       = (fwd_eps_val - trail_eps_val) / abs(trail_eps_val)
+            earn_traj_raw       = ((fwd_eps_val - trail_eps_val)
+                                   / abs(trail_eps_val))
             result["earn_traj"] = max(-1.0, min(1.0, earn_traj_raw))
 
+        # MC fallback
         if result["mc"] is None:
             mc_y = sf(info.get("marketCap"))
-            if mc_y:
-                result["mc"] = mc_y
+            if mc_y: result["mc"] = mc_y
 
+        # 52W fallback
         if result["hi52"] is None:
             h52 = sf(info.get("fiftyTwoWeekHigh"))
             if h52: result["hi52"] = h52
@@ -456,85 +493,86 @@ def _fetch_yahoo_fundamentals_one(t):
             l52 = sf(info.get("fiftyTwoWeekLow"))
             if l52: result["lo52"] = l52
 
+        # Interest Coverage
         try:
             qfin = obj.quarterly_financials
             if qfin is not None and not qfin.empty:
-                ebit_row = None
-                for nm in ["EBIT", "Operating Income", "Ebit"]:
-                    if nm in qfin.index:
-                        ebit_row = nm; break
-                int_row = None
-                for nm in ["Interest Expense",
-                           "Interest Expense Non Operating",
-                           "Net Interest Income"]:
-                    if nm in qfin.index:
-                        int_row = nm; break
+                ebit_row = next(
+                    (nm for nm in ["EBIT", "Operating Income", "Ebit"]
+                     if nm in qfin.index), None)
+                int_row = next(
+                    (nm for nm in ["Interest Expense",
+                                   "Interest Expense Non Operating",
+                                   "Net Interest Income"]
+                     if nm in qfin.index), None)
                 if ebit_row and int_row:
                     ebit_ttm = qfin.loc[ebit_row].dropna().head(4).sum()
                     int_ttm  = abs(qfin.loc[int_row].dropna().head(4).sum())
                     if int_ttm > 0 and ebit_ttm > 0:
-                        result["int_coverage"] = min(float(ebit_ttm / int_ttm), 100.0)
+                        result["int_coverage"] = min(
+                            float(ebit_ttm / int_ttm), 100.0)
         except Exception:
             pass
 
+        # ROIC
         try:
             qfin = obj.quarterly_financials
             bs   = obj.quarterly_balance_sheet
             if (qfin is not None and not qfin.empty
                     and bs is not None and not bs.empty):
-                op_inc_row = None
-                for nm in ["Operating Income", "EBIT", "Ebit"]:
-                    if nm in qfin.index:
-                        op_inc_row = nm; break
-                tax_row = None
-                for nm in ["Tax Provision", "Income Tax Expense", "Tax Expense"]:
-                    if nm in qfin.index:
-                        tax_row = nm; break
-                pretax_row = None
-                for nm in ["Pretax Income", "Income Before Tax", "EBT"]:
-                    if nm in qfin.index:
-                        pretax_row = nm; break
+                op_inc_row = next(
+                    (nm for nm in ["Operating Income", "EBIT", "Ebit"]
+                     if nm in qfin.index), None)
+                tax_row = next(
+                    (nm for nm in ["Tax Provision", "Income Tax Expense",
+                                   "Tax Expense"]
+                     if nm in qfin.index), None)
+                pretax_row = next(
+                    (nm for nm in ["Pretax Income", "Income Before Tax", "EBT"]
+                     if nm in qfin.index), None)
                 if op_inc_row:
-                    op_inc_ttm   = float(qfin.loc[op_inc_row].dropna().head(4).sum())
-                    eff_tax_rate = 0.25  # India default
+                    op_inc_ttm   = float(
+                        qfin.loc[op_inc_row].dropna().head(4).sum())
+                    eff_tax_rate = 0.25
                     if tax_row and pretax_row:
-                        tax_ttm    = float(qfin.loc[tax_row].dropna().head(4).sum())
-                        pretax_ttm = float(qfin.loc[pretax_row].dropna().head(4).sum())
+                        tax_ttm    = float(
+                            qfin.loc[tax_row].dropna().head(4).sum())
+                        pretax_ttm = float(
+                            qfin.loc[pretax_row].dropna().head(4).sum())
                         if pretax_ttm > 0 and tax_ttm >= 0:
-                            computed_rate = tax_ttm / pretax_ttm
-                            if 0 < computed_rate < 0.6:
-                                eff_tax_rate = computed_rate
+                            computed = tax_ttm / pretax_ttm
+                            if 0 < computed < 0.6:
+                                eff_tax_rate = computed
                     nopat      = op_inc_ttm * (1 - eff_tax_rate)
-                    equity_val = None
-                    for nm in ["Total Stockholders Equity", "Stockholders Equity",
-                               "Common Stock Equity",
-                               "Total Equity Gross Minority Interest"]:
-                        if nm in bs.index:
-                            eq_s = bs.loc[nm].dropna()
-                            if len(eq_s) > 0:
-                                equity_val = float(eq_s.iloc[0]); break
-                    debt_val = None
-                    for nm in ["Total Debt", "Net Debt", "Long Term Debt",
-                               "Long Term Debt And Capital Lease Obligation"]:
-                        if nm in bs.index:
-                            d_s = bs.loc[nm].dropna()
-                            if len(d_s) > 0:
-                                debt_val = float(d_s.iloc[0]); break
-                    cash_val = None
-                    for nm in ["Cash And Cash Equivalents",
-                               "Cash Cash Equivalents And Short Term Investments",
-                               "Cash Financial", "Cash And Short Term Investments"]:
-                        if nm in bs.index:
-                            c_s = bs.loc[nm].dropna()
-                            if len(c_s) > 0:
-                                cash_val = float(c_s.iloc[0]); break
+                    equity_val = next(
+                        (float(bs.loc[nm].dropna().iloc[0])
+                         for nm in ["Total Stockholders Equity",
+                                    "Stockholders Equity",
+                                    "Common Stock Equity",
+                                    "Total Equity Gross Minority Interest"]
+                         if nm in bs.index and len(bs.loc[nm].dropna()) > 0),
+                        None)
+                    debt_val = next(
+                        (float(bs.loc[nm].dropna().iloc[0])
+                         for nm in ["Total Debt", "Net Debt", "Long Term Debt",
+                                    "Long Term Debt And Capital Lease Obligation"]
+                         if nm in bs.index and len(bs.loc[nm].dropna()) > 0),
+                        None)
+                    cash_val = next(
+                        (float(bs.loc[nm].dropna().iloc[0])
+                         for nm in ["Cash And Cash Equivalents",
+                                    "Cash Cash Equivalents And Short Term Investments",
+                                    "Cash Financial",
+                                    "Cash And Short Term Investments"]
+                         if nm in bs.index and len(bs.loc[nm].dropna()) > 0),
+                        None)
                     if equity_val is not None and debt_val is not None:
-                        cash_use         = cash_val if cash_val is not None else 0
+                        cash_use         = cash_val or 0
                         invested_capital = equity_val + debt_val - cash_use
                         if invested_capital > 0 and nopat != 0:
-                            roic_computed = (nopat / invested_capital) * 100.0
-                            if -100 < roic_computed < 200:
-                                result["roic"] = roic_computed
+                            roic_val = (nopat / invested_capital) * 100.0
+                            if -100 < roic_val < 200:
+                                result["roic"] = roic_val
         except Exception:
             pass
 
@@ -549,13 +587,13 @@ def fetch_yahoo_fundamentals_all(tickers):
     out    = {}
     CHUNK  = 10
     WKRS   = 5
-    SLEEP  = 1.0
+    SLEEP  = 2.0   # increased sleep on cloud
     chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
     progress = st.progress(0)
     status   = st.empty()
     total    = len(chunks)
     for ci, chunk in enumerate(chunks):
-        status.text("Yahoo fundamentals {}/{} ({} of {} done)...".format(
+        status.text("Fetching fundamentals: chunk {}/{} ({} of {} tickers done)...".format(
             ci+1, total, ci*CHUNK, len(tl)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
             futures = {ex.submit(_fetch_yahoo_fundamentals_one, t): t for t in chunk}
@@ -568,7 +606,7 @@ def fetch_yahoo_fundamentals_all(tickers):
                     out[t] = {}
         progress.progress((ci + 1) / total)
         if ci < len(chunks) - 1:
-            time.sleep(SLEEP + random.uniform(0, 0.5))
+            time.sleep(SLEEP + random.uniform(0, 1.0))
     progress.empty()
     status.empty()
     return out
@@ -582,7 +620,8 @@ def fetch_last4_revenue_parallel(tickers):
 
     def one(t):
         try:
-            qf = yf.Ticker(t).quarterly_financials
+            obj = _get_ticker_with_session(t)
+            qf  = obj.quarterly_financials
             if qf is not None and "Total Revenue" in qf.index:
                 s = qf.loc["Total Revenue"].sort_index().tail(4)
                 v = [float(x) for x in s.values]
@@ -592,7 +631,7 @@ def fetch_last4_revenue_parallel(tickers):
             pass
         return t, [None, None, None, None]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
         for t, v in ex.map(one, tl):
             out[t] = v
     return out
@@ -716,8 +755,7 @@ def build_screener_table(universe_df, prices_map, yahoo_map, revenue_map, moment
         t   = r["Ticker"]
         sec = r["Sector"]
 
-        px_info   = prices_map.get(t, {})
-        price     = to_num(px_info.get("price"))
+        price     = to_num(prices_map.get(t, {}).get("price"))
         fi        = yahoo_map.get(t, {})
         mc        = to_num(fi.get("mc"))
         pe        = to_num(fi.get("pe"))
@@ -897,20 +935,28 @@ def render_sector_kpi_panel(scr, sector_sel):
 # ══════════════════════════════════════════════════════════════════════════════
 # APP ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="Nifty 50 Screener v2", layout="wide", page_icon="🇮🇳")
+st.set_page_config(
+    page_title="Nifty 50 Screener",
+    layout="wide",
+    page_icon="🇮🇳",
+    initial_sidebar_state="collapsed",
+)
 st.markdown(
     "<style>div[data-testid='stDataFrame'] table{font-size:13px;}"
     ".stDataFrame thead th{background:#1a1a2e;color:#93c5fd;font-weight:700;}</style>",
     unsafe_allow_html=True)
 
-st.markdown("## 🇮🇳 Nifty 50 Fundamental Screener v2")
+st.markdown("## 🇮🇳 Nifty 50 Fundamental Screener")
 st.caption(
-    "Wikipedia live universe · Yahoo Finance (.NS) · ROIC from quarterly financials · "
-    "Earn Traj from FwdEPS/TrailEPS · MC% of Nifty 50 · 5-factor scoring · INR throughout"
+    "Wikipedia live universe · Yahoo Finance (.NS) · ROIC from financials · "
+    "Earn Traj from FwdEPS/TrailEPS · MC% of Nifty 50 · 5-factor scoring · INR"
 )
 
-page_screener, page_reference = st.tabs(["📊 Screener", "📖 About"])
+page_screener, page_about, page_debug = st.tabs(["📊 Screener", "📖 About", "🔧 Debug"])
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 1 — SCREENER
+# ══════════════════════════════════════════════════════════════════════════════
 with page_screener:
     col_r, col_t = st.columns([1, 6])
     with col_r:
@@ -925,18 +971,19 @@ with page_screener:
         universe_df = get_nifty50_universe()
     tickers = tuple(universe_df["Ticker"].tolist())
 
-    with st.spinner("Fetching prices for {} tickers...".format(len(tickers))):
+    with st.spinner("Fetching prices..."):
         prices = fetch_prices_batch(tickers)
 
-    with st.spinner("Fetching momentum data..."):
+    with st.spinner("Fetching momentum..."):
         momentum = fetch_momentum_batch(tickers)
 
-    with st.spinner("Fetching Yahoo fundamentals..."):
+    with st.spinner("Fetching fundamentals (this takes ~2 min on first load)..."):
         yahoo_fundamentals = fetch_yahoo_fundamentals_all(tickers)
 
     with st.spinner("Fetching quarterly revenue..."):
         rev_map = fetch_last4_revenue_parallel(tickers)
 
+    # Coverage banner
     total_t  = len(tickers)
     has_pe   = sum(1 for t in tickers if yahoo_fundamentals.get(t, {}).get("pe")        is not None)
     has_fwd  = sum(1 for t in tickers if yahoo_fundamentals.get(t, {}).get("fwd_pe")    is not None)
@@ -958,8 +1005,10 @@ with page_screener:
     )
 
     with st.spinner("Building screener table..."):
-        scr = build_screener_table(universe_df, prices, yahoo_fundamentals, rev_map, momentum)
+        scr = build_screener_table(
+            universe_df, prices, yahoo_fundamentals, rev_map, momentum)
 
+    # Filters
     st.markdown("### Filters")
     with st.expander("Valuation & Size", expanded=True):
         fc1, fc2, fc3, fc4, fc5 = st.columns(5)
@@ -991,6 +1040,7 @@ with page_screener:
 
     render_sector_kpi_panel(scr, sector_sel)
 
+    # Apply filters
     filt = scr.copy()
     if sector_sel != "All Sectors":
         filt = filt[filt["Sector"] == sector_sel]
@@ -1075,20 +1125,99 @@ with page_screener:
 **MC% of Nifty50:** This stock's share of total Nifty 50 market cap.
 """)
 
-with page_reference:
-    st.markdown("## About — Nifty 50 Screener v2")
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 2 — ABOUT
+# ══════════════════════════════════════════════════════════════════════════════
+with page_about:
+    st.markdown("## About — Nifty 50 Screener")
     st.markdown("""
 ### Data Source
-**Yahoo Finance** via NSE `.NS` tickers · Universe from **Wikipedia (live)**
+**Yahoo Finance** via NSE `.NS` tickers · Universe from **Wikipedia (live, refreshed every 24hr)**
 
 ### India-Specific Notes
 | Item | Detail |
 |------|--------|
 | Default tax rate (ROIC) | 25% India corporate |
-| Market cap display | ₹Cr (crores) / ₹L Cr (lakh crore) |
-| MC% denominator | Sum of all 50 Nifty constituents |
+| Market cap display | ₹Cr / ₹L Cr |
+| MC% denominator | Sum of all Nifty 50 constituents |
 | Universe refresh | Every 24 hours from Wikipedia |
 
 ### Scoring Model
 `Valuation 25% + Quality 25% + PEG 20% + Earn Traj 15% + Momentum 15%`
+
+All ranking is within-sector. Rank 1 in Financials = best Financials stock only.
 """)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 3 — DEBUG
+# ══════════════════════════════════════════════════════════════════════════════
+with page_debug:
+    st.markdown("## 🔧 Debug — Raw Yahoo Data")
+    st.caption("Use this to diagnose data issues on this server. Tests a single ticker live.")
+
+    test_ticker = st.text_input("Test ticker (NSE format)", value="RELIANCE.NS")
+
+    if st.button("▶ Run diagnostic"):
+        with st.spinner("Fetching {}...".format(test_ticker)):
+            obj = _get_ticker_with_session(test_ticker)
+
+            st.markdown("### yfinance version")
+            st.code(yf.__version__)
+
+            st.markdown("### fast_info")
+            try:
+                fi = obj.fast_info
+                st.json({
+                    "last_price":  sf(getattr(fi, "last_price",  None)),
+                    "market_cap":  sf(getattr(fi, "market_cap",  None)),
+                    "year_high":   sf(getattr(fi, "year_high",   None)),
+                    "year_low":    sf(getattr(fi, "year_low",    None)),
+                })
+            except Exception as e:
+                st.error("fast_info failed: {}".format(e))
+
+            st.markdown("### .info (key fields)")
+            try:
+                info = obj.info or {}
+                if info:
+                    relevant = {k: info.get(k) for k in [
+                        "currentPrice", "regularMarketPrice",
+                        "trailingPE", "forwardPE", "pegRatio",
+                        "trailingEps", "forwardEps",
+                        "returnOnEquity", "operatingMargins",
+                        "debtToEquity", "earningsGrowth",
+                        "marketCap", "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
+                    ]}
+                    st.json(relevant)
+                    if all(v is None for v in relevant.values()):
+                        st.warning("⚠️ All values are None — Yahoo may be rate-limiting this server IP")
+                else:
+                    st.error("❌ .info returned empty dict — rate limit or IP block likely")
+            except Exception as e:
+                st.error(".info failed: {}".format(e))
+
+            st.markdown("### quarterly_financials row names")
+            try:
+                qf = obj.quarterly_financials
+                if qf is not None and not qf.empty:
+                    st.success("✅ {} rows found".format(len(qf.index)))
+                    st.write(list(qf.index))
+                else:
+                    st.warning("⚠️ quarterly_financials is empty")
+            except Exception as e:
+                st.error("quarterly_financials failed: {}".format(e))
+
+            st.markdown("### quarterly_balance_sheet row names")
+            try:
+                bs = obj.quarterly_balance_sheet
+                if bs is not None and not bs.empty:
+                    st.success("✅ {} rows found".format(len(bs.index)))
+                    st.write(list(bs.index))
+                else:
+                    st.warning("⚠️ quarterly_balance_sheet is empty")
+            except Exception as e:
+                st.error("quarterly_balance_sheet failed: {}".format(e))
+
+            st.markdown("### Universe check")
+            st.dataframe(universe_df if "universe_df" in dir() else
+                         get_nifty50_universe())
