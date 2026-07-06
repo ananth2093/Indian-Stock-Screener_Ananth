@@ -762,3 +762,285 @@ with page_screener:
 ```toml
 [fmp]
 api_key = "your_key_here"
+""")
+st.stop()
+
+col_r, col_t = st.columns([1, 6])
+with col_r:
+if st.button("🔄 Refresh"):
+st.cache_data.clear()
+st.rerun()
+with col_t:
+st.caption("Last loaded: {} · Prices: 1hr cache · Fundamentals: 24hr cache".format(
+datetime.now().strftime("%I:%M %p")))
+
+with st.spinner("Loading universe from Wikipedia..."):
+universe_df = get_nifty50_universe()
+tickers = tuple(universe_df["Ticker"].tolist())
+
+with st.spinner("Fetching FMP quotes (price, PE, MC, 52W)..."):
+fmp_quotes = fetch_fmp_quotes(tickers, fmp_key)
+
+with st.spinner("Fetching FMP ratios (ROE, margins, ROIC, PEG)..."):
+fmp_ratios = fetch_fmp_ratios(tickers, fmp_key)
+
+with st.spinner("Fetching FMP income statements (EPS, revenue)..."):
+fmp_income = fetch_fmp_income(tickers, fmp_key)
+
+with st.spinner("Fetching momentum data (yfinance)..."):
+momentum = fetch_momentum_batch(tickers)
+
+total_t   = len(tickers)
+has_price = sum(1 for t in tickers if fmp_quotes.get(t, {}).get("price") is not None)
+has_pe    = sum(1 for t in tickers if fmp_quotes.get(t, {}).get("pe")    is not None)
+has_roe   = sum(1 for t in tickers if fmp_ratios.get(t, {}).get("roe")   is not None)
+has_roic  = sum(1 for t in tickers if fmp_ratios.get(t, {}).get("roic")  is not None)
+has_et    = sum(1 for t in tickers if fmp_income.get(t, {}).get("earn_traj") is not None)
+has_mom   = sum(1 for t in tickers if momentum.get(t, {}).get("momentum_score") is not None)
+
+coverage_color = "info" if has_price >= total_t * 0.7 else "warning"
+getattr(st, coverage_color)(
+"Data coverage — "
+"Price: {}/{} ({:.0f}%) · "
+"P/E: {}/{} ({:.0f}%) · "
+"ROE: {}/{} ({:.0f}%) · "
+"ROIC: {}/{} ({:.0f}%) · "
+"Earn Traj: {}/{} ({:.0f}%) · "
+"Momentum: {}/{} ({:.0f}%) · "
+"Source: FMP + yfinance".format(
+has_price, total_t, has_price / total_t * 100,
+has_pe,    total_t, has_pe    / total_t * 100,
+has_roe,   total_t, has_roe   / total_t * 100,
+has_roic,  total_t, has_roic  / total_t * 100,
+has_et,    total_t, has_et    / total_t * 100,
+has_mom,   total_t, has_mom   / total_t * 100,
+)
+)
+
+with st.spinner("Building screener table..."):
+scr = build_screener_table(
+universe_df, fmp_quotes, fmp_ratios, fmp_income, momentum)
+
+if scr.empty:
+st.error("No data returned. Check your FMP API key in the Debug tab.")
+st.stop()
+
+── Filters ───────────────────────────────────────────────────────────────
+st.markdown("### Filters")
+with st.expander("Valuation & Size", expanded=True):
+fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+all_sectors = sorted(scr["Sector"].dropna().unique().tolist())
+sector_sel  = fc1.selectbox("Sector", ["All Sectors"] + all_sectors)
+sort_by     = fc2.selectbox("Sort by", [
+"Sector then Rank","Score high to low","Conviction high to low",
+"MC% of Nifty50 high to low","Price low to high","Price high to low",
+"Mkt Cap high to low","PE low to high","Fwd PE low to high",
+"PEG low to high","Quality Score high","ROIC high to low",
+"Earn Traj high to low","Momentum Score high",
+"52W Pos low to high","Rev Growth high to low",
+])
+pe_max   = fc3.number_input("Max PE",            value=9999,  step=10)
+peg_max  = fc4.number_input("Max PEG",           value=999.0, step=1.0)
+mc_min_c = fc5.number_input("Min Mkt Cap (₹Cr)", value=0,     step=5000)
+
+with st.expander("Quality Filters", expanded=False):
+qc1, qc2, qc3, qc4 = st.columns(4)
+roic_min_f = qc1.number_input("Min ROIC (%)",         value=0.0, step=5.0)
+ic_min_f   = qc2.number_input("Min Int Coverage (x)", value=0.0, step=1.0)
+om_min_f   = qc3.number_input("Min Op Margin (%)",    value=0.0, step=5.0)
+qual_min_f = qc4.number_input("Min Quality Score",    value=0.0, step=5.0)
+
+with st.expander("Momentum & Earnings", expanded=False):
+mc1, mc2 = st.columns(2)
+mom_min = mc1.number_input("Min Momentum Score", value=-999.0, step=5.0)
+et_min  = mc2.number_input("Min Earn Traj",      value=-1.0,   step=0.1)
+
+render_sector_kpi_panel(scr, sector_sel)
+
+filt = scr.copy()
+if sector_sel != "All Sectors":
+filt = filt[filt["Sector"] == sector_sel]
+filt = filt[(filt["Mkt Cap (₹Cr)"].isna()) | (filt["Mkt Cap (₹Cr)"] >= mc_min_c)]
+filt = filt[(filt["P/E"].isna())            | (filt["P/E"]           <= pe_max)]
+filt = filt[(filt["PEG"].isna())            | (filt["PEG"]           <= peg_max)]
+filt = filt[(filt["ROIC%"].isna())          | (filt["ROIC%"]         >= roic_min_f)]
+filt = filt[(filt["Int Coverage"].isna())   | (filt["Int Coverage"]  >= ic_min_f)]
+filt = filt[(filt["Op Margin%"].isna())     | (filt["Op Margin%"]    >= om_min_f)]
+filt = filt[(filt["Quality Score"].isna())  | (filt["Quality Score"] >= qual_min_f)]
+filt = filt[(filt["Momentum Score"].isna()) | (filt["Momentum Score"] >= mom_min)]
+filt = filt[(filt["Earn Traj"].isna())      | (filt["Earn Traj"]     >= et_min)]
+
+sort_map = {
+"Sector then Rank":           (["Sector","Rank"],       [True, True]),
+"Score high to low":          (["Score"],               [False]),
+"Conviction high to low":     (["Conviction Score"],    [False]),
+"MC% of Nifty50 high to low": (["MC% of Nifty50"],     [False]),
+"Price low to high":          (["Price (₹)"],           [True]),
+"Price high to low":          (["Price (₹)"],           [False]),
+"Mkt Cap high to low":        (["Mkt Cap (₹Cr)"],       [False]),
+"PE low to high":             (["P/E"],                 [True]),
+"Fwd PE low to high":         (["Fwd P/E"],             [True]),
+"PEG low to high":            (["PEG"],                 [True]),
+"Quality Score high":         (["Quality Score"],       [False]),
+"ROIC high to low":           (["ROIC%"],               [False]),
+"Earn Traj high to low":      (["Earn Traj"],           [False]),
+"Momentum Score high":        (["Momentum Score"],      [False]),
+"52W Pos low to high":        (["52W Pos%"],            [True]),
+"Rev Growth high to low":     (["Rev Growth% (CAGR)"],  [False]),
+}
+sc, sa = sort_map.get(sort_by, (["Sector","Rank"], [True, True]))
+filt   = filt.sort_values(sc, ascending=sa, na_position="last")
+
+st.caption("Showing {} of {} stocks · Sector: {} · Sort: {}".format(
+len(filt), len(scr), sector_sel, sort_by))
+
+disp = filt.copy()
+for c in ["P/E","Fwd P/E","PEG","Earn Traj","52W Pos%",
+"ROIC%","ROE%","Int Coverage","Op Margin%","Debt/Eq",
+"Quality Score","Momentum Score","Ret 1Mo%","Ret 3Mo%",
+"Ret 6Mo%","Trailing Vol%","Score","Conviction Score",
+"Rev Growth% (CAGR)","MC% of Nifty50","Price (₹)","Mkt Cap (₹Cr)",
+"Rev Q1 (₹Cr)","Rev Q2 (₹Cr)","Rev Q3 (₹Cr)","Rev Q4 (₹Cr)"]:
+if c in disp.columns:
+disp[c] = disp[c].round(2)
+
+disp["Quality Flag"] = disp.apply(
+lambda r: quality_flag(r.get("ROIC%"), r.get("ROE%"),
+r.get("Int Coverage"),
+r.get("Op Margin%"), r.get("Debt/Eq")), axis=1)
+disp["Rank"] = disp["Rank"].apply(lambda v: int(v) if pd.notna(v) else pd.NA)
+
+COLS = [
+"Ticker","Sector",
+"Price (₹)","Mkt Cap (₹Cr)","MC% of Nifty50",
+"P/E","Fwd P/E","PEG","PEG Method","Earn Traj",
+"ROIC%","ROE%","Int Coverage","Op Margin%","Debt/Eq",
+"Quality Score","Quality Flag",
+"Momentum Score","Ret 1Mo%","Ret 3Mo%","Ret 6Mo%","Trailing Vol%",
+"52W Pos%","Score","Conviction Score","Rank",
+"Rev Q1 (₹Cr)","Rev Q2 (₹Cr)","Rev Q3 (₹Cr)","Rev Q4 (₹Cr)",
+"Rev Growth% (CAGR)",
+]
+disp_final = disp[[c for c in COLS if c in disp.columns]].copy()
+st.dataframe(disp_final, use_container_width=True, height=680)
+
+st.download_button(
+label="⬇ Download CSV",
+data=disp_final.to_csv(index=False).encode("utf-8"),
+file_name="nifty50_screener_{}.csv".format(
+datetime.now().strftime("%Y%m%d_%H%M")),
+mime="text/csv",
+)
+
+st.markdown("""
+P/E: Trailing twelve months from FMP /quote.
+
+Fwd P/E: TTM P/E from FMP /ratios-ttm (true forward PE requires FMP paid tier).
+
+PEG: < 1.0 = potentially undervalued. Only computed when EPS growth ≥ 5%.
+
+Earn Traj: YoY EPS change from quarterly income statements. Range −1.0 to +1.0.
+
+ROIC / ROE / Op Margin: Converted from FMP decimal format (0.15 → 15%).
+
+MC% of Nifty50: Stock's share of total Nifty 50 market cap.
+""")
+
+══════════════════════════════════════════════════════════════════════════════
+TAB 2 — ABOUT
+══════════════════════════════════════════════════════════════════════════════
+with page_about:
+st.markdown("## About — Nifty 50 Screener v5")
+st.markdown("""
+
+Data Architecture
+Field	Source	Endpoint
+Price, MC, 52W, Trailing P/E	FMP	/quote/{symbol} (bulk)
+TTM P/E, PEG, ROE, Op Margin, D/E, Int Coverage, ROIC	FMP	/ratios-ttm/{symbol}
+EPS, Revenue (quarterly), Earn Traj	FMP	/income-statement?period=quarter
+Momentum (price returns, volatility)	yfinance	price history download
+Universe	Wikipedia	NIFTY_50 page
+FMP Free Tier Limitations
+Available Free	Requires Paid Tier
+Trailing P/E	True Forward P/E
+TTM Ratios (ROE, ROIC, PEG)	Analyst estimates
+Quarterly income / balance sheet	Real-time quotes
+Scoring Model
+Valuation 25% + Quality 25% + PEG 20% + Earn Traj 15% + Momentum 15%
+
+Scores are sector-relative percentile ranks. Missing data applies a penalty
+(−15% for 2 missing factors, −30% for 3 or more).
+""")
+
+══════════════════════════════════════════════════════════════════════════════
+TAB 3 — DEBUG
+══════════════════════════════════════════════════════════════════════════════
+with page_debug:
+st.markdown("## 🔧 Debug — API Diagnostics")
+fmp_key_dbg = get_fmp_key()
+test_sym    = st.text_input("Ticker (with .NS)", value="RELIANCE.NS")
+if st.button("▶ Run diagnostic"):
+    if not fmp_key_dbg:
+        st.error("No FMP key found in Streamlit Secrets.")
+    else:
+        with st.spinner("Testing {}...".format(test_sym)):
+
+            st.markdown("### 1. FMP /quote")
+            d = fmp_get("quote/{}".format(test_sym), fmp_key_dbg)
+            if d and isinstance(d, list) and len(d) > 0:
+                item = d[0]
+                st.success("✅ /quote OK")
+                st.json({k: item.get(k) for k in
+                         ["symbol","price","pe","marketCap",
+                          "yearHigh","yearLow","name","currency"]})
+            else:
+                st.error("❌ /quote empty — verify API key and that ticker "
+                         "format is RELIANCE.NS not RELIANCE")
+
+            st.markdown("### 2. FMP /ratios-ttm")
+            d = fmp_get("ratios-ttm/{}".format(test_sym), fmp_key_dbg)
+            if d and isinstance(d, list) and len(d) > 0:
+                item = d[0]
+                st.success("✅ /ratios-ttm OK")
+                st.json({k: item.get(k) for k in [
+                    "returnOnEquityTTM",
+                    "returnOnInvestedCapitalTTM",
+                    "operatingProfitMarginTTM",
+                    "interestCoverageTTM",
+                    "priceEarningsGrowthRatioTTM",
+                    "priceToEarningsRatioTTM",
+                    "debtEquityRatioTTM",
+                ]})
+            else:
+                st.warning("⚠️ /ratios-ttm empty — may require FMP paid tier")
+
+            st.markdown("### 3. FMP /income-statement (quarterly)")
+            d = fmp_get(
+                "income-statement/{}".format(test_sym), fmp_key_dbg,
+                params={"period": "quarter", "limit": "4"}
+            )
+            if d and isinstance(d, list) and len(d) > 0:
+                st.success("✅ /income-statement OK — {} quarters".format(len(d)))
+                st.json({k: d[0].get(k) for k in
+                         ["date","revenue","eps","netIncome","period"]})
+            else:
+                st.error("❌ /income-statement empty")
+
+            st.markdown("### 4. yfinance momentum test")
+            try:
+                test_df = yf.download(
+                    test_sym, period="3mo", interval="1d",
+                    auto_adjust=True, progress=False)
+                if not test_df.empty:
+                    st.success("✅ yfinance OK — {} rows, latest close: {:.2f}".format(
+                        len(test_df),
+                        float(test_df["Close"].dropna().iloc[-1])))
+                else:
+                    st.warning("⚠️ yfinance returned empty DataFrame")
+            except Exception as ex:
+                st.error("❌ yfinance error: {}".format(ex))
+
+            st.markdown("### 5. API key check")
+            st.code("Key prefix: {}...  Length: {}".format(
+                fmp_key_dbg[:6] if len(fmp_key_dbg) > 6 else fmp_key_dbg,
+                len(fmp_key_dbg)))
