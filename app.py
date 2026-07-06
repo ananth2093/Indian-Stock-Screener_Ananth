@@ -825,7 +825,7 @@ if scr.empty:
 st.error("No data returned. Check your FMP API key in the Debug tab.")
 st.stop()
 
-── Filters ───────────────────────────────────────────────────────────────
+#── Filters ───────────────────────────────────────────────────────────────
 st.markdown("### Filters")
 with st.expander("Valuation & Size", expanded=True):
 fc1, fc2, fc3, fc4, fc5 = st.columns(5)
