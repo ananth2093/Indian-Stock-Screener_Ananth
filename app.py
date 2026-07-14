@@ -1,4 +1,4 @@
-# app.py  (Nifty 50 Screener v6 — FMP .NSE fix + yfinance Series fix)
+# app.py  (Nifty 50 Screener v6 — FMP bare symbol fix)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -81,16 +81,14 @@ SECTOR_MAP = {
 }
 
 # ─── Ticker helpers ───────────────────────────────────────────────────────────
-# yfinance uses RELIANCE.NS  (NSE suffix)
-# FMP uses      RELIANCE.NSE (FMP's own NSE suffix)
+# FMP Indian stocks: bare symbol only — e.g. RELIANCE, TCS, HDFCBANK
+# yfinance Indian stocks: TICKER.NS  — e.g. RELIANCE.NS, TCS.NS
 
 def yf_ticker(base):
-    """base = 'RELIANCE'  ->  'RELIANCE.NS'"""
     return base + ".NS"
 
 def fmp_ticker(base):
-    """base = 'RELIANCE'  ->  'RELIANCE.NSE'"""
-    return base + ".NSE"
+    return base        # FMP uses bare symbol for Indian NSE stocks
 
 # ─── FMP Key ──────────────────────────────────────────────────────────────────
 def get_fmp_key():
@@ -182,6 +180,36 @@ def decimal_to_pct(val):
         return v * 100.0
     return v
 
+# ─── FMP symbol search — resolve exact symbol for a given company name ────────
+@st.cache_data(ttl=86400)
+def resolve_fmp_symbols(base_symbols, api_key):
+    """
+    For each base symbol (e.g. 'RELIANCE'), probe FMP search to find
+    the correct symbol FMP uses. Falls back to bare symbol if search
+    returns nothing useful.
+    Returns dict: { 'RELIANCE': 'RELIANCE', 'BAJAJ-AUTO': 'BAJAJ-AUTO', ... }
+    """
+    resolved = {}
+    for sym in base_symbols:
+        # Try bare symbol first (direct hit)
+        d = fmp_get("quote/{}".format(sym), api_key)
+        if d and isinstance(d, list) and len(d) > 0 and d[0].get("price"):
+            resolved[sym] = sym
+            continue
+        # Try search endpoint
+        d = fmp_get("search", api_key, params={"query": sym, "limit": "5", "exchange": "NSE"})
+        if d and isinstance(d, list):
+            for item in d:
+                s = str(item.get("symbol", ""))
+                # prefer exact match or NSE-listed
+                if item.get("exchangeShortName", "") in ("NSE", "BSE"):
+                    resolved[sym] = s
+                    break
+        if sym not in resolved:
+            resolved[sym] = sym   # fallback: use as-is
+        time.sleep(0.1)
+    return resolved
+
 # ─── Universe ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
 def get_nifty50_universe():
@@ -237,23 +265,22 @@ def get_nifty50_universe():
                         gics = gics_name
                         break
             data.append({
-                "Base":       raw_t,                  # e.g. RELIANCE
-                "YF Ticker":  yf_ticker(raw_t),       # e.g. RELIANCE.NS
-                "FMP Ticker": fmp_ticker(raw_t),      # e.g. RELIANCE.NSE
-                "Sector":     gics or raw_s,
+                "Base":      raw_t,
+                "YF Ticker": yf_ticker(raw_t),
+                "Sector":    gics or raw_s,
                 "NSE Sector": raw_s,
             })
 
         if len(data) < 30:
             raise RuntimeError("Only {} rows".format(len(data)))
 
-        df = pd.DataFrame(data).drop_duplicates(subset=["FMP Ticker"])
+        df = pd.DataFrame(data).drop_duplicates(subset=["Base"])
         st.success("Universe: {} stocks from Wikipedia".format(len(df)))
         return df
 
     except Exception as e:
         st.warning("Wikipedia failed: {}. Using fallback list.".format(e))
-        fallback_bases = [
+        fallback = [
             ("RELIANCE",   "Energy"),
             ("TCS",        "Information Technology"),
             ("HDFCBANK",   "Financials"),
@@ -266,9 +293,8 @@ def get_nifty50_universe():
             ("LT",         "Industrials"),
         ]
         return pd.DataFrame([
-            {"Base": b, "YF Ticker": yf_ticker(b), "FMP Ticker": fmp_ticker(b),
-             "Sector": s, "NSE Sector": s}
-            for b, s in fallback_bases
+            {"Base": b, "YF Ticker": yf_ticker(b), "Sector": s, "NSE Sector": s}
+            for b, s in fallback
         ])
 
 # ─── FMP Quotes ───────────────────────────────────────────────────────────────
@@ -287,10 +313,10 @@ def _fill_quote(out, sym, item):
     }
 
 @st.cache_data(ttl=3600)
-def fetch_fmp_quotes(fmp_tickers, api_key):
-    """fmp_tickers: tuple of FMP-format tickers e.g. ('RELIANCE.NSE', ...)"""
-    out = {t: {} for t in fmp_tickers}
-    tl  = list(fmp_tickers)
+def fetch_fmp_quotes(fmp_symbols, api_key):
+    """fmp_symbols: tuple of resolved FMP symbols e.g. ('RELIANCE', 'TCS', ...)"""
+    out = {t: {} for t in fmp_symbols}
+    tl  = list(fmp_symbols)
 
     # Bulk call
     syms_str = ",".join(tl)
@@ -304,7 +330,7 @@ def fetch_fmp_quotes(fmp_tickers, api_key):
         if filled >= len(tl) * 0.5:
             return out
 
-    # Individual fallback for missing
+    # Individual fallback
     missing = [t for t in tl if out[t].get("price") is None]
     if missing:
         def one_quote(t):
@@ -321,9 +347,9 @@ def fetch_fmp_quotes(fmp_tickers, api_key):
 
 # ─── FMP Ratios TTM ───────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
-def fetch_fmp_ratios(fmp_tickers, api_key):
+def fetch_fmp_ratios(fmp_symbols, api_key):
     out = {}
-    tl  = list(fmp_tickers)
+    tl  = list(fmp_symbols)
 
     def one(t):
         data = fmp_get("ratios-ttm/{}".format(t), api_key)
@@ -380,9 +406,9 @@ def fetch_fmp_ratios(fmp_tickers, api_key):
 
 # ─── FMP Income Statement ─────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
-def fetch_fmp_income(fmp_tickers, api_key):
+def fetch_fmp_income(fmp_symbols, api_key):
     out = {}
-    tl  = list(fmp_tickers)
+    tl  = list(fmp_symbols)
 
     def one(t):
         data = fmp_get(
@@ -432,27 +458,16 @@ def fetch_fmp_income(fmp_tickers, api_key):
 # ─── Momentum (yfinance — uses .NS tickers) ───────────────────────────────────
 @st.cache_data(ttl=3600)
 def fetch_momentum_batch(yf_tickers):
-    """yf_tickers: tuple of YF-format tickers e.g. ('RELIANCE.NS', ...)"""
     tl  = list(yf_tickers)
     out = {t: {} for t in tl}
 
     def _safe_series(obj, ticker):
-        """
-        Extract a clean float Series from whatever yfinance returns.
-        Handles: plain Series, single-col DataFrame, MultiIndex DataFrame.
-        Fixes: 'float() argument must be a string or a real number, not Series'
-        """
         if obj is None:
             return pd.Series(dtype=float)
-
-        # Already a Series
         if isinstance(obj, pd.Series):
             return pd.to_numeric(obj, errors="coerce").dropna()
-
         if not isinstance(obj, pd.DataFrame) or obj.empty:
             return pd.Series(dtype=float)
-
-        # MultiIndex columns: ("Close", "RELIANCE.NS")
         if isinstance(obj.columns, pd.MultiIndex):
             try:
                 col = obj["Close"][ticker]
@@ -461,7 +476,6 @@ def fetch_momentum_batch(yf_tickers):
                 return pd.to_numeric(col, errors="coerce").dropna()
             except (KeyError, TypeError):
                 pass
-            # fallback: flatten first Close column found
             try:
                 close_cols = [(l0, l1) for l0, l1 in obj.columns if str(l0) == "Close"]
                 if close_cols:
@@ -472,14 +486,11 @@ def fetch_momentum_batch(yf_tickers):
             except Exception:
                 pass
             return pd.Series(dtype=float)
-
-        # Flat columns
         if "Close" in obj.columns:
             col = obj["Close"]
             if isinstance(col, pd.DataFrame):
                 col = col.iloc[:, 0]
             return pd.to_numeric(col, errors="coerce").dropna()
-
         return pd.Series(dtype=float)
 
     def _process_batch(batch):
@@ -502,12 +513,10 @@ def fetch_momentum_batch(yf_tickers):
         result = {}
         for t in batch:
             try:
-                # For single-ticker downloads, raw_d/raw_m are flat DataFrames
                 if len(batch) == 1:
                     closes_d = _safe_series(raw_d, t)
                     closes_m = _safe_series(raw_m, t)
                 else:
-                    # Multi-ticker: slice per ticker then extract Close
                     try:
                         td = raw_d[t] if t in raw_d.columns.get_level_values(1) else raw_d
                         tm = raw_m[t] if t in raw_m.columns.get_level_values(1) else raw_m
@@ -666,9 +675,9 @@ def compute_conviction_scores(scr):
 def build_screener_table(universe_df, fmp_quotes, fmp_ratios, fmp_income, momentum_map):
     rows = []
     for _, r in universe_df.iterrows():
-        fmp_t = r["FMP Ticker"]   # for FMP lookups
-        yf_t  = r["YF Ticker"]    # for momentum lookups
-        base  = r["Base"]         # display symbol
+        base  = r["Base"]
+        yf_t  = r["YF Ticker"]
+        fmp_t = r.get("FMP Symbol", base)
         sec   = r["Sector"]
 
         fq  = fmp_quotes.get(fmp_t, {})
@@ -731,7 +740,7 @@ def build_screener_table(universe_df, fmp_quotes, fmp_ratios, fmp_income, moment
 
         rows.append({
             "Ticker":            base,
-            "FMP Ticker":        fmp_t,
+            "FMP Symbol":        fmp_t,
             "YF Ticker":         yf_t,
             "Sector":            sec,
             "Price (Rs)":        price,
@@ -869,7 +878,7 @@ st.markdown(
 )
 
 st.markdown("## Nifty 50 Fundamental Screener")
-st.caption("FMP API (.NSE tickers) + yfinance (.NS tickers) · Wikipedia universe · 5-factor scoring · INR")
+st.caption("FMP API (bare symbols) + yfinance (.NS) · Wikipedia universe · 5-factor scoring · INR")
 
 page_screener, page_about, page_debug = st.tabs(["Screener", "About", "Debug"])
 
@@ -904,27 +913,32 @@ with page_screener:
     with st.spinner("Loading universe from Wikipedia..."):
         universe_df = get_nifty50_universe()
 
-    fmp_tickers = tuple(universe_df["FMP Ticker"].tolist())   # .NSE for FMP
-    yf_tickers  = tuple(universe_df["YF Ticker"].tolist())    # .NS  for yfinance
+    with st.spinner("Resolving FMP symbols (probing API for correct symbol format)..."):
+        base_symbols   = tuple(universe_df["Base"].tolist())
+        fmp_symbol_map = resolve_fmp_symbols(base_symbols, fmp_key)
+        universe_df["FMP Symbol"] = universe_df["Base"].map(fmp_symbol_map)
+
+    fmp_symbols = tuple(universe_df["FMP Symbol"].tolist())
+    yf_tickers  = tuple(universe_df["YF Ticker"].tolist())
 
     with st.spinner("Fetching FMP quotes (price, PE, MC, 52W)..."):
-        fmp_quotes = fetch_fmp_quotes(fmp_tickers, fmp_key)
+        fmp_quotes = fetch_fmp_quotes(fmp_symbols, fmp_key)
 
     with st.spinner("Fetching FMP ratios (ROE, margins, ROIC, PEG)..."):
-        fmp_ratios = fetch_fmp_ratios(fmp_tickers, fmp_key)
+        fmp_ratios = fetch_fmp_ratios(fmp_symbols, fmp_key)
 
     with st.spinner("Fetching FMP income statements (EPS, revenue)..."):
-        fmp_income = fetch_fmp_income(fmp_tickers, fmp_key)
+        fmp_income = fetch_fmp_income(fmp_symbols, fmp_key)
 
     with st.spinner("Fetching momentum data (yfinance)..."):
         momentum = fetch_momentum_batch(yf_tickers)
 
-    total_t   = len(fmp_tickers)
-    has_price = sum(1 for t in fmp_tickers if fmp_quotes.get(t, {}).get("price") is not None)
-    has_pe    = sum(1 for t in fmp_tickers if fmp_quotes.get(t, {}).get("pe")    is not None)
-    has_roe   = sum(1 for t in fmp_tickers if fmp_ratios.get(t, {}).get("roe")   is not None)
-    has_roic  = sum(1 for t in fmp_tickers if fmp_ratios.get(t, {}).get("roic")  is not None)
-    has_et    = sum(1 for t in fmp_tickers if fmp_income.get(t, {}).get("earn_traj") is not None)
+    total_t   = len(fmp_symbols)
+    has_price = sum(1 for t in fmp_symbols if fmp_quotes.get(t, {}).get("price") is not None)
+    has_pe    = sum(1 for t in fmp_symbols if fmp_quotes.get(t, {}).get("pe")    is not None)
+    has_roe   = sum(1 for t in fmp_symbols if fmp_ratios.get(t, {}).get("roe")   is not None)
+    has_roic  = sum(1 for t in fmp_symbols if fmp_ratios.get(t, {}).get("roic")  is not None)
+    has_et    = sum(1 for t in fmp_symbols if fmp_income.get(t, {}).get("earn_traj") is not None)
     has_mom   = sum(1 for t in yf_tickers  if momentum.get(t,  {}).get("momentum_score") is not None)
 
     coverage_color = "info" if has_price >= total_t * 0.7 else "warning"
@@ -933,7 +947,7 @@ with page_screener:
         "Price: {}/{} ({:.0f}%) · P/E: {}/{} ({:.0f}%) · "
         "ROE: {}/{} ({:.0f}%) · ROIC: {}/{} ({:.0f}%) · "
         "Earn Traj: {}/{} ({:.0f}%) · Momentum: {}/{} ({:.0f}%) · "
-        "FMP tickers use .NSE · yfinance uses .NS".format(
+        "FMP symbols resolved via API probe".format(
             has_price, total_t, has_price / total_t * 100,
             has_pe,    total_t, has_pe    / total_t * 100,
             has_roe,   total_t, has_roe   / total_t * 100,
@@ -947,10 +961,9 @@ with page_screener:
         scr = build_screener_table(universe_df, fmp_quotes, fmp_ratios, fmp_income, momentum)
 
     if scr.empty:
-        st.error("No data returned. Check your FMP API key in the Debug tab.")
+        st.error("No data returned. Use the Debug tab to diagnose.")
         st.stop()
 
-    # ── Filters ───────────────────────────────────────────────────────────────
     st.markdown("### Filters")
     with st.expander("Valuation and Size", expanded=True):
         fc1, fc2, fc3, fc4, fc5 = st.columns(5)
@@ -1061,22 +1074,17 @@ with page_screener:
     st.markdown("---")
     st.markdown("**Column Glossary**")
     st.markdown(
-        "- **P/E**: Trailing TTM from FMP /quote; falls back to /ratios-ttm if absent.\n"
-        "- **PEG**: < 1.0 potentially undervalued. Computed only when EPS growth >= 5%.\n"
-        "- **Earn Traj**: YoY EPS change, clamped to [-1, +1]. Positive = earnings growing.\n"
-        "- **ROIC% / ROE%**: Converted from FMP decimal (0.15 -> 15%). ROIC preferred.\n"
-        "- **Int Coverage**: EBIT / Interest, already a multiple, not converted. Capped at 100x.\n"
-        "- **Op Margin%**: Operating margin, converted from FMP decimal.\n"
-        "- **Debt/Eq**: Debt-to-equity ratio as reported by FMP.\n"
-        "- **Quality Score**: 0-100 composite. Returns None (not 0) when all inputs missing.\n"
-        "- **Quality Flag**: Flags ROIC/ROE < 8%, Int Coverage < 3x, Op Margin < 5%.\n"
-        "- **52W Pos%**: Price position in 52W range. 0% = 52W low, 100% = 52W high.\n"
-        "- **MC% of Nifty50**: Stock share of total Nifty 50 market cap.\n"
-        "- **Rev Growth% (YoY)**: Newest quarter vs same quarter one year prior.\n"
-        "- **Score**: Sector-relative percentile. Valuation 25% + Quality 25% + PEG 20% + Earn Traj 15% + Momentum 15%.\n"
-        "- **Conviction Score**: Score adjusted for data completeness and sector discount, 0-100.\n"
-        "- **Rank**: Within-sector rank by Score (1 = best in sector).\n"
-        "- **Ticker source**: FMP uses TICKER.NSE format · yfinance uses TICKER.NS format.\n"
+        "- **P/E**: TTM from FMP /quote; falls back to /ratios-ttm.\n"
+        "- **PEG**: < 1.0 potentially undervalued. Only when EPS growth >= 5%.\n"
+        "- **Earn Traj**: YoY EPS change clamped to [-1, +1]. Positive = growing.\n"
+        "- **ROIC% / ROE%**: Converted from FMP decimal (0.15 -> 15%).\n"
+        "- **Int Coverage**: Already a multiple, not converted. Capped at 100x.\n"
+        "- **Quality Score**: 0-100. None when all inputs missing.\n"
+        "- **Quality Flag**: ROIC/ROE < 8%, IntCov < 3x, Margin < 5% flagged.\n"
+        "- **52W Pos%**: 0% = 52W low, 100% = 52W high.\n"
+        "- **Rev Growth% (YoY)**: Newest quarter vs same quarter prior year.\n"
+        "- **Score**: Valuation 25% + Quality 25% + PEG 20% + Earn Traj 15% + Momentum 15%.\n"
+        "- **Rank**: Within-sector rank by Score (1 = best).\n"
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1085,63 +1093,30 @@ with page_screener:
 with page_about:
     st.markdown("## About - Nifty 50 Screener v6")
 
-    st.markdown("### Ticker Format by Data Source")
+    st.markdown("### Ticker Format by Source")
     st.markdown(
         "| Source | Format | Example |\n"
         "|---|---|---|\n"
-        "| FMP (quotes, ratios, income) | TICKER.NSE | RELIANCE.NSE |\n"
-        "| yfinance (momentum / price history) | TICKER.NS | RELIANCE.NS |\n"
-        "| Display | Base symbol only | RELIANCE |\n"
+        "| FMP (quotes, ratios, income) | Bare symbol (resolved via API probe) | RELIANCE |\n"
+        "| yfinance (momentum) | TICKER.NS | RELIANCE.NS |\n"
+        "| Display | Base symbol | RELIANCE |\n"
     )
 
     st.markdown("### Data Architecture")
     st.markdown(
         "| Field | Source | Endpoint |\n"
         "|---|---|---|\n"
-        "| Price, MC, 52W, Trailing P/E | FMP | /quote/{symbol} (bulk) |\n"
-        "| TTM P/E (fallback), PEG, ROE, Op Margin, D/E, Int Coverage, ROIC | FMP | /ratios-ttm/{symbol} |\n"
-        "| EPS, Revenue (quarterly), Earn Traj | FMP | /income-statement?period=quarter |\n"
-        "| Momentum (price returns, volatility) | yfinance | price history download |\n"
+        "| Price, MC, 52W, Trailing P/E | FMP | /quote/{symbol} |\n"
+        "| PEG, ROE, ROIC, Op Margin, D/E, Int Coverage | FMP | /ratios-ttm/{symbol} |\n"
+        "| EPS, Revenue, Earn Traj | FMP | /income-statement?period=quarter |\n"
+        "| Momentum | yfinance | price history |\n"
         "| Universe | Wikipedia | NIFTY_50 page |\n"
-    )
-
-    st.markdown("### FMP Free Tier Limitations")
-    st.markdown(
-        "| Available Free | Requires Paid Tier |\n"
-        "|---|---|\n"
-        "| Trailing P/E | True Forward P/E (analyst estimates) |\n"
-        "| TTM Ratios (ROE, ROIC, PEG) | Real-time quotes |\n"
-        "| Quarterly income / balance sheet | Analyst EPS consensus |\n"
     )
 
     st.markdown("### Scoring Model")
     st.code(
-        "Score = 25% Valuation (P/E percentile, lower = better)\n"
-        "      + 25% Quality   (ROIC + Int Coverage + Op Margin composite)\n"
-        "      + 20% PEG       (lower = better)\n"
-        "      + 15% Earn Traj (YoY EPS direction)\n"
-        "      + 15% Momentum  (6M-1M skip return / trailing volatility)",
+        "Score = 25% Valuation + 25% Quality + 20% PEG + 15% Earn Traj + 15% Momentum",
         language=None,
-    )
-    st.markdown(
-        "Scores are sector-relative percentile ranks. "
-        "Missing data applies a penalty: -15% for 2 missing factors, -30% for 3 or more."
-    )
-
-    st.markdown("### Key Fixes")
-    st.markdown(
-        "| # | Issue | Fix |\n"
-        "|---|---|---|\n"
-        "| 1 | FMP returned empty for all endpoints | Switched from .NS to .NSE ticker format for FMP |\n"
-        "| 2 | yfinance float() Series error | _safe_series() normalises all yfinance return shapes |\n"
-        "| 3 | st.stop() outside if block | Moved inside if not fmp_key block |\n"
-        "| 4 | Revenue growth inverted CAGR | Replaced with YoY: newest Q / same Q prior year |\n"
-        "| 5 | Fwd P/E was mislabelled TTM P/E | Removed; noted paid-tier requirement |\n"
-        "| 6 | decimal_to_pct on int coverage | Int coverage passed raw (already a multiple) |\n"
-        "| 7 | quality_score returned 0 for all-None | Now returns None to trigger missing penalty |\n"
-        "| 8 | Quality Flag missing from display | Added to COLS list |\n"
-        "| 9 | earn_traj clipping lost nuance | Divide raw by 2.0 before clamping |\n"
-        "| 10 | pos52 could exceed 100% | Clamped to 0-105% |\n"
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1152,35 +1127,55 @@ with page_debug:
     fmp_key_dbg = get_fmp_key()
 
     st.info(
-        "FMP ticker format for Indian NSE stocks: **RELIANCE.NSE** (not RELIANCE.NS). "
-        "yfinance uses RELIANCE.NS. Both are handled automatically in the screener."
+        "FMP Indian stock format: bare symbol with no exchange suffix. "
+        "Use 'RELIANCE', not 'RELIANCE.NS' or 'RELIANCE.NSE'. "
+        "The screener resolves the correct symbol automatically via FMP search."
     )
 
     col_a, col_b = st.columns(2)
     test_base = col_a.text_input("Base symbol (no suffix)", value="RELIANCE")
-    test_fmp  = fmp_ticker(test_base.upper().strip())
     test_yf   = yf_ticker(test_base.upper().strip())
-    col_b.markdown("**FMP ticker:** `{}`  |  **yfinance ticker:** `{}`".format(test_fmp, test_yf))
+    col_b.markdown("**FMP symbol:** `{}`  |  **yfinance ticker:** `{}`".format(
+        test_base.upper().strip(), test_yf))
 
     if st.button("Run diagnostic"):
         if not fmp_key_dbg:
             st.error("No FMP key found in Streamlit Secrets.")
         else:
-            with st.spinner("Testing {}...".format(test_base)):
+            test_sym = test_base.upper().strip()
+            with st.spinner("Testing {}...".format(test_sym)):
 
-                st.markdown("### 1. FMP /quote ({})".format(test_fmp))
-                d = fmp_get("quote/{}".format(test_fmp), fmp_key_dbg)
-                if d and isinstance(d, list) and len(d) > 0:
+                st.markdown("### 1. FMP /quote ({})".format(test_sym))
+                d = fmp_get("quote/{}".format(test_sym), fmp_key_dbg)
+                if d and isinstance(d, list) and len(d) > 0 and d[0].get("price"):
                     item = d[0]
-                    st.success("/quote OK")
+                    st.success("/quote OK — symbol '{}' works on FMP".format(test_sym))
                     st.json({k: item.get(k) for k in
                              ["symbol", "price", "pe", "marketCap",
                               "yearHigh", "yearLow", "name", "currency"]})
                 else:
-                    st.error("/quote empty for {} - check API key or try another ticker".format(test_fmp))
+                    st.error("/quote empty for bare symbol '{}'".format(test_sym))
+                    st.markdown("Trying FMP search to find the correct symbol...")
+                    d2 = fmp_get("search", fmp_key_dbg,
+                                 params={"query": test_sym, "limit": "10", "exchange": "NSE"})
+                    if d2 and isinstance(d2, list) and len(d2) > 0:
+                        st.warning("FMP search results for '{}':".format(test_sym))
+                        st.json([{"symbol": x.get("symbol"),
+                                  "name": x.get("name"),
+                                  "exchange": x.get("exchangeShortName")}
+                                 for x in d2[:5]])
+                        st.info("Use the correct symbol from the search results above in the input box.")
+                    else:
+                        st.error(
+                            "Search also returned empty. Possible causes:\n"
+                            "1. FMP free tier does not cover Indian stocks for this key\n"
+                            "2. API key has exceeded rate limits\n"
+                            "3. FMP requires a paid plan for NSE data\n\n"
+                            "Verify at: https://financialmodelingprep.com/developer/docs/pricing"
+                        )
 
-                st.markdown("### 2. FMP /ratios-ttm ({})".format(test_fmp))
-                d = fmp_get("ratios-ttm/{}".format(test_fmp), fmp_key_dbg)
+                st.markdown("### 2. FMP /ratios-ttm ({})".format(test_sym))
+                d = fmp_get("ratios-ttm/{}".format(test_sym), fmp_key_dbg)
                 if d and isinstance(d, list) and len(d) > 0:
                     item = d[0]
                     st.success("/ratios-ttm OK")
@@ -1197,48 +1192,26 @@ with page_debug:
                         "Op Margin%":                        decimal_to_pct(item.get("operatingProfitMarginTTM")),
                         "Int Coverage (raw, no conversion)": item.get("interestCoverageTTM"),
                         "PEG":                               item.get("priceEarningsGrowthRatioTTM"),
-                        "TTM P/E (ratios fallback)":         item.get("priceToEarningsRatioTTM"),
                     })
                 else:
-                    st.warning("/ratios-ttm empty for {} - may require FMP paid tier".format(test_fmp))
+                    st.warning("/ratios-ttm empty for '{}' - may need paid FMP tier".format(test_sym))
 
-                st.markdown("### 3. FMP /income-statement ({})".format(test_fmp))
+                st.markdown("### 3. FMP /income-statement ({})".format(test_sym))
                 d = fmp_get(
-                    "income-statement/{}".format(test_fmp), fmp_key_dbg,
+                    "income-statement/{}".format(test_sym), fmp_key_dbg,
                     params={"period": "quarter", "limit": "5"},
                 )
                 if d and isinstance(d, list) and len(d) > 0:
                     st.success("/income-statement OK - {} quarters".format(len(d)))
                     st.json({k: d[0].get(k) for k in
                              ["date", "revenue", "eps", "netIncome", "period"]})
-                    if len(d) >= 4:
-                        eps_r = sf(d[0].get("eps"))
-                        eps_o = sf(d[3].get("eps"))
-                        rev_r = sf(d[0].get("revenue"))
-                        rev_o = sf(d[3].get("revenue"))
-                        et = None
-                        if eps_r and eps_o and abs(eps_o) > 0.001:
-                            raw_et = (eps_r - eps_o) / abs(eps_o)
-                            et     = max(-1.0, min(1.0, raw_et / 2.0))
-                        rg = None
-                        if rev_r and rev_o and rev_o > 0:
-                            rg = (rev_r / rev_o - 1) * 100.0
-                        st.markdown("**Computed metrics:**")
-                        st.json({
-                            "EPS recent (Q0)":     eps_r,
-                            "EPS 1yr ago (Q3)":    eps_o,
-                            "Earn Traj (clamped)": et,
-                            "Rev YoY Growth%":     rg,
-                        })
                 else:
-                    st.error("/income-statement empty for {}".format(test_fmp))
+                    st.error("/income-statement empty for '{}'".format(test_sym))
 
-                st.markdown("### 4. yfinance momentum test ({})".format(test_yf))
+                st.markdown("### 4. yfinance ({})".format(test_yf))
                 try:
-                    test_df = yf.download(
-                        test_yf, period="3mo", interval="1d",
-                        auto_adjust=True, progress=False,
-                    )
+                    test_df = yf.download(test_yf, period="3mo", interval="1d",
+                                          auto_adjust=True, progress=False)
                     if not test_df.empty:
                         close_col = test_df["Close"]
                         if isinstance(close_col, pd.DataFrame):
@@ -1247,11 +1220,16 @@ with page_debug:
                         st.success("yfinance OK - {} rows, latest close: {:.2f}".format(
                             len(test_df), latest))
                     else:
-                        st.warning("yfinance returned empty DataFrame for {}".format(test_yf))
+                        st.warning("yfinance empty for {}".format(test_yf))
                 except Exception as ex:
                     st.error("yfinance error: {}".format(ex))
 
-                st.markdown("### 5. API key check")
+                st.markdown("### 5. FMP plan check")
+                st.markdown(
+                    "Verify your plan covers Indian (NSE) stocks at: "
+                    "https://financialmodelingprep.com/developer/docs/pricing\n\n"
+                    "Free tier covers US stocks. NSE stocks may require the **Starter** plan (~$19/mo)."
+                )
                 st.code("Key prefix: {}...  Length: {}".format(
                     fmp_key_dbg[:6] if len(fmp_key_dbg) > 6 else fmp_key_dbg,
                     len(fmp_key_dbg),
