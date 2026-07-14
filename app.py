@@ -1,4 +1,4 @@
-# app.py  (Nifty 50 Screener v6 — FMP bare symbol fix)
+# app.py  (Nifty 50 Screener v7 — yfinance only, no FMP dependency)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,8 +9,6 @@ import re
 import warnings
 import concurrent.futures
 from datetime import datetime
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 warnings.filterwarnings("ignore")
 
@@ -80,24 +78,6 @@ SECTOR_MAP = {
     "Realty":                            "Real Estate",
 }
 
-# ─── Ticker helpers ───────────────────────────────────────────────────────────
-# FMP Indian stocks: bare symbol only — e.g. RELIANCE, TCS, HDFCBANK
-# yfinance Indian stocks: TICKER.NS  — e.g. RELIANCE.NS, TCS.NS
-
-def yf_ticker(base):
-    return base + ".NS"
-
-def fmp_ticker(base):
-    return base        # FMP uses bare symbol for Indian NSE stocks
-
-# ─── FMP Key ──────────────────────────────────────────────────────────────────
-def get_fmp_key():
-    try:
-        k = st.secrets["fmp"]["api_key"]
-        return k if k and k.strip() and k != "YOUR_KEY_HERE" else None
-    except Exception:
-        return None
-
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def to_num(x):
     return pd.to_numeric(x, errors="coerce")
@@ -151,27 +131,6 @@ def revenue_growth_yoy(rev4):
     except Exception:
         return None
 
-def fmp_get(endpoint, api_key, params=None):
-    base = "https://financialmodelingprep.com/api/v3"
-    p    = dict(params or {})
-    p["apikey"] = api_key
-    try:
-        session = requests.Session()
-        adapter = HTTPAdapter(max_retries=Retry(
-            total=3, backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504]))
-        session.mount("https://", adapter)
-        r = session.get("{}/{}".format(base, endpoint), params=p, timeout=20)
-        if r.status_code == 403:
-            return None
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, dict) and "Error Message" in data:
-            return None
-        return data
-    except Exception:
-        return None
-
 def decimal_to_pct(val):
     if val is None:
         return None
@@ -180,35 +139,19 @@ def decimal_to_pct(val):
         return v * 100.0
     return v
 
-# ─── FMP symbol search — resolve exact symbol for a given company name ────────
-@st.cache_data(ttl=86400)
-def resolve_fmp_symbols(base_symbols, api_key):
-    """
-    For each base symbol (e.g. 'RELIANCE'), probe FMP search to find
-    the correct symbol FMP uses. Falls back to bare symbol if search
-    returns nothing useful.
-    Returns dict: { 'RELIANCE': 'RELIANCE', 'BAJAJ-AUTO': 'BAJAJ-AUTO', ... }
-    """
-    resolved = {}
-    for sym in base_symbols:
-        # Try bare symbol first (direct hit)
-        d = fmp_get("quote/{}".format(sym), api_key)
-        if d and isinstance(d, list) and len(d) > 0 and d[0].get("price"):
-            resolved[sym] = sym
-            continue
-        # Try search endpoint
-        d = fmp_get("search", api_key, params={"query": sym, "limit": "5", "exchange": "NSE"})
-        if d and isinstance(d, list):
-            for item in d:
-                s = str(item.get("symbol", ""))
-                # prefer exact match or NSE-listed
-                if item.get("exchangeShortName", "") in ("NSE", "BSE"):
-                    resolved[sym] = s
-                    break
-        if sym not in resolved:
-            resolved[sym] = sym   # fallback: use as-is
-        time.sleep(0.1)
-    return resolved
+def safe_float(obj):
+    """Extract a scalar float from a value that might be a pd.Series."""
+    if obj is None:
+        return None
+    if isinstance(obj, pd.Series):
+        obj = obj.dropna()
+        if obj.empty:
+            return None
+        obj = obj.iloc[0]
+    try:
+        return float(obj)
+    except Exception:
+        return None
 
 # ─── Universe ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
@@ -244,9 +187,11 @@ def get_nifty50_universe():
             if header_row else []
         )
         ticker_col = next(
-            (i for i, h in enumerate(headers) if any(k in h for k in ["symbol", "ticker", "nse"])), 2)
+            (i for i, h in enumerate(headers)
+             if any(k in h for k in ["symbol", "ticker", "nse"])), 2)
         sector_col = next(
-            (i for i, h in enumerate(headers) if any(k in h for k in ["sector", "industry", "gics"])), 1)
+            (i for i, h in enumerate(headers)
+             if any(k in h for k in ["sector", "industry", "gics"])), 1)
 
         data = []
         for row in table.find_all("tr")[1:]:
@@ -266,7 +211,7 @@ def get_nifty50_universe():
                         break
             data.append({
                 "Base":      raw_t,
-                "YF Ticker": yf_ticker(raw_t),
+                "Ticker":    raw_t + ".NS",
                 "Sector":    gics or raw_s,
                 "NSE Sector": raw_s,
             })
@@ -274,7 +219,7 @@ def get_nifty50_universe():
         if len(data) < 30:
             raise RuntimeError("Only {} rows".format(len(data)))
 
-        df = pd.DataFrame(data).drop_duplicates(subset=["Base"])
+        df = pd.DataFrame(data).drop_duplicates(subset=["Ticker"])
         st.success("Universe: {} stocks from Wikipedia".format(len(df)))
         return df
 
@@ -291,110 +236,198 @@ def get_nifty50_universe():
             ("SBIN",       "Financials"),
             ("BHARTIARTL", "Communication Services"),
             ("LT",         "Industrials"),
+            ("KOTAKBANK",  "Financials"),
+            ("AXISBANK",   "Financials"),
+            ("WIPRO",      "Information Technology"),
+            ("HCLTECH",    "Information Technology"),
+            ("ASIANPAINT", "Materials"),
+            ("MARUTI",     "Consumer Discretionary"),
+            ("BAJFINANCE",  "Financials"),
+            ("TITAN",      "Consumer Discretionary"),
+            ("SUNPHARMA",  "Health Care"),
+            ("ULTRACEMCO", "Materials"),
         ]
         return pd.DataFrame([
-            {"Base": b, "YF Ticker": yf_ticker(b), "Sector": s, "NSE Sector": s}
+            {"Base": b, "Ticker": b + ".NS", "Sector": s, "NSE Sector": s}
             for b, s in fallback
         ])
 
-# ─── FMP Quotes ───────────────────────────────────────────────────────────────
-def _fill_quote(out, sym, item):
-    pe = sf(item.get("pe"))
-    mc = sf(item.get("marketCap"))
-    hi = sf(item.get("yearHigh"))
-    lo = sf(item.get("yearLow"))
-    px = sf(item.get("price"))
-    out[sym] = {
-        "price": px,
-        "mc":    mc,
-        "hi52":  hi,
-        "lo52":  lo,
-        "pe":    pe if (pe is not None and 0 < pe <= 10000) else None,
-    }
+# ─── yfinance fundamentals ────────────────────────────────────────────────────
+def _extract_scalar(info, *keys, default=None):
+    """Pull the first available key from a yfinance info dict as a float."""
+    for k in keys:
+        v = info.get(k)
+        if v is not None:
+            try:
+                f = float(v)
+                if not np.isnan(f):
+                    return f
+            except Exception:
+                pass
+    return default
+
+def _quarterly_revenues(ticker_obj):
+    """
+    Return last 4 quarterly revenues (newest first) from yfinance
+    quarterly_financials or quarterly_income_stmt.
+    Values in native currency (INR for .NS tickers).
+    """
+    for attr in ("quarterly_income_stmt", "quarterly_financials"):
+        try:
+            df = getattr(ticker_obj, attr)
+            if df is None or df.empty:
+                continue
+            # Look for a Total Revenue row
+            for label in ["Total Revenue", "Revenue", "Net Revenue"]:
+                matches = [r for r in df.index if label.lower() in str(r).lower()]
+                if matches:
+                    row = df.loc[matches[0]]
+                    vals = []
+                    for col in sorted(row.index, reverse=True)[:4]:
+                        v = safe_float(row[col])
+                        vals.append(v)
+                    while len(vals) < 4:
+                        vals.append(None)
+                    return vals[:4]
+        except Exception:
+            pass
+    return [None, None, None, None]
+
+def _quarterly_eps(ticker_obj):
+    """Return (eps_recent, eps_1yr_ago) from quarterly financials."""
+    for attr in ("quarterly_income_stmt", "quarterly_financials"):
+        try:
+            df = getattr(ticker_obj, attr)
+            if df is None or df.empty:
+                continue
+            for label in ["Basic EPS", "Diluted EPS", "EPS"]:
+                matches = [r for r in df.index if label.lower() in str(r).lower()]
+                if matches:
+                    row  = df.loc[matches[0]]
+                    cols = sorted(row.index, reverse=True)
+                    eps_r = safe_float(row[cols[0]]) if len(cols) > 0 else None
+                    eps_o = safe_float(row[cols[3]]) if len(cols) > 3 else None
+                    return eps_r, eps_o
+        except Exception:
+            pass
+    # fallback: derive from net income / shares
+    return None, None
 
 @st.cache_data(ttl=3600)
-def fetch_fmp_quotes(fmp_symbols, api_key):
-    """fmp_symbols: tuple of resolved FMP symbols e.g. ('RELIANCE', 'TCS', ...)"""
-    out = {t: {} for t in fmp_symbols}
-    tl  = list(fmp_symbols)
-
-    # Bulk call
-    syms_str = ",".join(tl)
-    data = fmp_get("quote/{}".format(syms_str), api_key)
-    if data and isinstance(data, list) and len(data) > 0:
-        for item in data:
-            sym = str(item.get("symbol", "")).upper().strip()
-            if sym in out:
-                _fill_quote(out, sym, item)
-        filled = sum(1 for v in out.values() if v.get("price") is not None)
-        if filled >= len(tl) * 0.5:
-            return out
-
-    # Individual fallback
-    missing = [t for t in tl if out[t].get("price") is None]
-    if missing:
-        def one_quote(t):
-            d = fmp_get("quote/{}".format(t), api_key)
-            if d and isinstance(d, list) and len(d) > 0:
-                return t, d[0]
-            return t, None
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-            for t, item in ex.map(one_quote, missing):
-                if item:
-                    _fill_quote(out, t, item)
-        time.sleep(0.3)
-    return out
-
-# ─── FMP Ratios TTM ───────────────────────────────────────────────────────────
-@st.cache_data(ttl=86400)
-def fetch_fmp_ratios(fmp_symbols, api_key):
-    out = {}
-    tl  = list(fmp_symbols)
+def fetch_yf_fundamentals(tickers):
+    """
+    Fetch all fundamental data from yfinance for a tuple of .NS tickers.
+    Returns dict keyed by ticker with all fields needed for the screener.
+    """
+    out = {t: {} for t in tickers}
 
     def one(t):
-        data = fmp_get("ratios-ttm/{}".format(t), api_key)
-        if not data or not isinstance(data, list) or len(data) == 0:
+        try:
+            ticker_obj = yf.Ticker(t)
+            info       = ticker_obj.info or {}
+
+            # ── Price / market data ──────────────────────────────────────────
+            price = _extract_scalar(info, "currentPrice", "regularMarketPrice",
+                                    "previousClose")
+            mc    = _extract_scalar(info, "marketCap")
+            hi52  = _extract_scalar(info, "fiftyTwoWeekHigh")
+            lo52  = _extract_scalar(info, "fiftyTwoWeekLow")
+
+            # ── Valuation ────────────────────────────────────────────────────
+            pe       = _extract_scalar(info, "trailingPE")
+            fwd_pe   = _extract_scalar(info, "forwardPE")
+            peg_yf   = _extract_scalar(info, "pegRatio")
+
+            # ── Quality / margins ────────────────────────────────────────────
+            roe_raw  = _extract_scalar(info, "returnOnEquity")
+            roic_raw = _extract_scalar(info, "returnOnAssets")   # yf has no direct ROIC
+            om_raw   = _extract_scalar(info, "operatingMargins")
+            gm_raw   = _extract_scalar(info, "grossMargins")
+            de_raw   = _extract_scalar(info, "debtToEquity")
+            cr_raw   = _extract_scalar(info, "currentRatio")
+
+            # yf returns ROE/margins as decimals (0.15 = 15%)
+            roe  = decimal_to_pct(roe_raw)
+            roic = decimal_to_pct(roic_raw)   # using ROA as proxy for ROIC
+            om   = decimal_to_pct(om_raw)
+
+            # Interest coverage: yfinance doesn't expose it directly
+            # Derive from ebitda / interestExpense if available
+            ebitda   = _extract_scalar(info, "ebitda")
+            int_exp  = _extract_scalar(info, "interestExpense")
+            ic = None
+            if ebitda is not None and int_exp is not None and int_exp != 0:
+                ic = min(abs(ebitda / int_exp), 100.0)
+
+            # ── EPS growth ───────────────────────────────────────────────────
+            eps_r, eps_o = _quarterly_eps(ticker_obj)
+            earn_traj    = None
+            eps_growth   = None
+            if eps_r is not None and eps_o is not None and abs(eps_o) > 0.001:
+                raw        = (eps_r - eps_o) / abs(eps_o)
+                earn_traj  = max(-1.0, min(1.0, raw / 2.0))
+                eps_growth = raw * 100.0
+
+            # Fallback: use yf's own EPS trend fields
+            if earn_traj is None:
+                eps_curr = _extract_scalar(info, "trailingEps")
+                eps_fwd  = _extract_scalar(info, "forwardEps")
+                if eps_curr is not None and eps_fwd is not None and abs(eps_curr) > 0.001:
+                    raw       = (eps_fwd - eps_curr) / abs(eps_curr)
+                    earn_traj = max(-1.0, min(1.0, raw / 2.0))
+                    eps_growth = raw * 100.0
+
+            # ── Revenue (quarterly) ──────────────────────────────────────────
+            rev4 = _quarterly_revenues(ticker_obj)
+
+            # ── PEG ─────────────────────────────────────────────────────────
+            peg = None
+            peg_method = "N/A"
+            if peg_yf is not None and 0 < peg_yf <= 500:
+                peg        = peg_yf
+                peg_method = "yfinance"
+            else:
+                pe_for_peg = fwd_pe if fwd_pe is not None else pe
+                if eps_growth is not None and pe_for_peg is not None:
+                    eg = float(eps_growth)
+                    if eg >= MIN_GROWTH_PCT_FOR_PEG:
+                        peg        = pe_for_peg / eg
+                        peg_method = "Calc"
+            if peg is not None and (peg <= 0 or peg > 500):
+                peg = None
+
+            return t, {
+                "price":     price,
+                "mc":        mc,
+                "hi52":      hi52,
+                "lo52":      lo52,
+                "pe":        pe    if (pe    is not None and 0 < pe    <= 10000) else None,
+                "fwd_pe":    fwd_pe if (fwd_pe is not None and 0 < fwd_pe <= 10000) else None,
+                "peg":       peg,
+                "peg_method": peg_method,
+                "roe":       roe,
+                "roic":      roic,
+                "op_margin": om,
+                "int_coverage": ic,
+                "debt_eq":   de_raw,
+                "earn_traj": earn_traj,
+                "eps_growth": eps_growth,
+                "rev4":      rev4,
+            }
+        except Exception as ex:
             return t, {}
-        item     = data[0]
-        peg_raw  = sf(item.get("priceEarningsGrowthRatioTTM"))
-        roic_raw = sf(item.get("returnOnInvestedCapitalTTM"))
-        roe_raw  = sf(item.get("returnOnEquityTTM"))
-        om_raw   = sf(item.get("operatingProfitMarginTTM"))
-        ic_raw   = sf(item.get("interestCoverageTTM"))
-        de_raw   = sf(item.get("debtEquityRatioTTM"))
-        pe_ttm_r = sf(item.get("priceToEarningsRatioTTM"))
 
-        roic = decimal_to_pct(roic_raw)
-        roe  = decimal_to_pct(roe_raw)
-        om   = decimal_to_pct(om_raw)
-
-        ic = None
-        if ic_raw is not None and ic_raw > 0:
-            ic = min(float(ic_raw), 100.0)
-
-        peg = float(peg_raw) if (peg_raw is not None and 0 < peg_raw <= 500) else None
-        pe_ttm_ratios = (
-            float(pe_ttm_r) if (pe_ttm_r is not None and 0 < pe_ttm_r <= 10000) else None
-        )
-
-        return t, {
-            "peg":           peg,
-            "roic":          roic,
-            "roe":           roe,
-            "op_margin":     om,
-            "int_coverage":  ic,
-            "debt_eq":       de_raw,
-            "pe_ttm_ratios": pe_ttm_ratios,
-        }
-
+    # Process in batches with threading
     CHUNK  = 10
-    SLEEP  = 0.3 if len(tl) <= 50 else 1.0
+    SLEEP  = 0.5
+    tl     = list(tickers)
     chunks = [tl[i:i + CHUNK] for i in range(0, len(tl), CHUNK)]
     prog   = st.progress(0)
     stat   = st.empty()
     for ci, chunk in enumerate(chunks):
-        stat.text("FMP ratios: {}/{} tickers...".format(ci * CHUNK, len(tl)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        stat.text("yfinance fundamentals: {}/{} tickers...".format(
+            min(ci * CHUNK, len(tl)), len(tl)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
             for t, d in ex.map(one, chunk):
                 out[t] = d
         prog.progress((ci + 1) / len(chunks))
@@ -404,61 +437,10 @@ def fetch_fmp_ratios(fmp_symbols, api_key):
     stat.empty()
     return out
 
-# ─── FMP Income Statement ─────────────────────────────────────────────────────
-@st.cache_data(ttl=86400)
-def fetch_fmp_income(fmp_symbols, api_key):
-    out = {}
-    tl  = list(fmp_symbols)
-
-    def one(t):
-        data = fmp_get(
-            "income-statement/{}".format(t), api_key,
-            params={"period": "quarter", "limit": "5"},
-        )
-        if not data or not isinstance(data, list) or len(data) == 0:
-            return t, {}
-
-        rev4 = [sf(q.get("revenue")) for q in data[:4]]
-        while len(rev4) < 4:
-            rev4.append(None)
-
-        eps_recent = sf(data[0].get("eps")) if len(data) > 0 else None
-        eps_old    = sf(data[3].get("eps")) if len(data) >= 4 else None
-
-        earn_traj  = None
-        eps_growth = None
-        if eps_recent is not None and eps_old is not None and abs(eps_old) > 0.001:
-            raw        = (eps_recent - eps_old) / abs(eps_old)
-            earn_traj  = max(-1.0, min(1.0, raw / 2.0))
-            eps_growth = raw * 100.0
-
-        return t, {
-            "rev4":       rev4,
-            "earn_traj":  earn_traj,
-            "eps_growth": eps_growth,
-        }
-
-    CHUNK  = 10
-    SLEEP  = 0.3 if len(tl) <= 50 else 1.0
-    chunks = [tl[i:i + CHUNK] for i in range(0, len(tl), CHUNK)]
-    prog   = st.progress(0)
-    stat   = st.empty()
-    for ci, chunk in enumerate(chunks):
-        stat.text("FMP income: {}/{} tickers...".format(ci * CHUNK, len(tl)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-            for t, d in ex.map(one, chunk):
-                out[t] = d
-        prog.progress((ci + 1) / len(chunks))
-        if ci < len(chunks) - 1:
-            time.sleep(SLEEP)
-    prog.empty()
-    stat.empty()
-    return out
-
-# ─── Momentum (yfinance — uses .NS tickers) ───────────────────────────────────
+# ─── Momentum ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
-def fetch_momentum_batch(yf_tickers):
-    tl  = list(yf_tickers)
+def fetch_momentum_batch(tickers):
+    tl  = list(tickers)
     out = {t: {} for t in tl}
 
     def _safe_series(obj, ticker):
@@ -672,57 +654,39 @@ def compute_conviction_scores(scr):
     return scr.drop(columns=["_comp", "_disc"])
 
 # ─── Build Table ──────────────────────────────────────────────────────────────
-def build_screener_table(universe_df, fmp_quotes, fmp_ratios, fmp_income, momentum_map):
+def build_screener_table(universe_df, yf_fundamentals, momentum_map):
     rows = []
     for _, r in universe_df.iterrows():
-        base  = r["Base"]
-        yf_t  = r["YF Ticker"]
-        fmp_t = r.get("FMP Symbol", base)
-        sec   = r["Sector"]
+        t   = r["Ticker"]
+        base = r["Base"]
+        sec  = r["Sector"]
 
-        fq  = fmp_quotes.get(fmp_t, {})
-        fr  = fmp_ratios.get(fmp_t, {})
-        fi  = fmp_income.get(fmp_t, {})
+        fd  = yf_fundamentals.get(t, {})
+        mom = momentum_map.get(t, {})
 
-        price         = to_num(fq.get("price"))
-        mc            = to_num(fq.get("mc"))
-        pe_quote      = to_num(fq.get("pe"))
-        pe_ttm_ratios = to_num(fr.get("pe_ttm_ratios"))
-        pe            = pe_quote if pd.notna(pe_quote) else pe_ttm_ratios
-
-        hi   = to_num(fq.get("hi52"))
-        lo   = to_num(fq.get("lo52"))
-        roic = to_num(fr.get("roic"))
-        roe  = to_num(fr.get("roe"))
-        ic   = to_num(fr.get("int_coverage"))
-        om   = to_num(fr.get("op_margin"))
-        de   = to_num(fr.get("debt_eq"))
-
-        earn_traj = to_num(fi.get("earn_traj"))
-        eps_g     = fi.get("eps_growth")
+        price  = to_num(fd.get("price"))
+        mc     = to_num(fd.get("mc"))
+        hi52   = to_num(fd.get("hi52"))
+        lo52   = to_num(fd.get("lo52"))
+        pe     = to_num(fd.get("pe"))
+        fwd_pe = to_num(fd.get("fwd_pe"))
+        peg    = to_num(fd.get("peg"))
+        peg_method = fd.get("peg_method", "N/A")
+        roic   = to_num(fd.get("roic"))
+        roe    = to_num(fd.get("roe"))
+        ic     = to_num(fd.get("int_coverage"))
+        om     = to_num(fd.get("op_margin"))
+        de     = to_num(fd.get("debt_eq"))
+        earn_traj  = to_num(fd.get("earn_traj"))
+        eps_growth = fd.get("eps_growth")
 
         pos52 = None
-        if pd.notna(price) and pd.notna(hi) and pd.notna(lo) and hi != lo:
-            pos52 = float(np.clip((price - lo) / (hi - lo) * 100.0, 0.0, 105.0))
+        if pd.notna(price) and pd.notna(hi52) and pd.notna(lo52) and hi52 != lo52:
+            pos52 = float(np.clip((price - lo52) / (hi52 - lo52) * 100.0, 0.0, 105.0))
 
-        rev4               = fi.get("rev4", [None] * 4)
+        rev4               = fd.get("rev4", [None] * 4)
         rq1, rq2, rq3, rq4 = [to_num(x) for x in rev4]
         growth             = revenue_growth_yoy([rq1, rq2, rq3, rq4])
-
-        peg_direct = to_num(fr.get("peg"))
-        peg        = None
-        peg_method = "N/A"
-        if pd.notna(peg_direct):
-            peg        = float(peg_direct)
-            peg_method = "FMP"
-        else:
-            if eps_g is not None and pd.notna(pe):
-                eg = float(eps_g)
-                if eg >= MIN_GROWTH_PCT_FOR_PEG:
-                    peg        = float(pe) / eg
-                    peg_method = "Calc"
-        if peg is not None and (peg <= 0 or peg > 500):
-            peg = None
 
         q_score = compute_quality_score(
             float(roic) if pd.notna(roic) else None,
@@ -731,7 +695,6 @@ def build_screener_table(universe_df, fmp_quotes, fmp_ratios, fmp_income, moment
             float(om)   if pd.notna(om)   else None,
         )
 
-        mom       = momentum_map.get(yf_t, {})
         ret_1mo   = to_num(mom.get("ret_1mo"))
         ret_3mo   = to_num(mom.get("ret_3mo"))
         ret_6mo   = to_num(mom.get("ret_6mo"))
@@ -740,18 +703,18 @@ def build_screener_table(universe_df, fmp_quotes, fmp_ratios, fmp_income, moment
 
         rows.append({
             "Ticker":            base,
-            "FMP Symbol":        fmp_t,
-            "YF Ticker":         yf_t,
+            "YF Ticker":         t,
             "Sector":            sec,
             "Price (Rs)":        price,
             "Mkt Cap (RsCr)":    (mc / 1e7) if mc is not None else None,
             "Mkt Cap Raw":       mc,
             "P/E":               pe,
-            "PEG":               to_num(peg),
+            "Fwd P/E":           fwd_pe,
+            "PEG":               peg,
             "PEG Method":        peg_method,
             "Earn Traj":         earn_traj,
             "52W Pos%":          to_num(pos52),
-            "ROIC%":             roic,
+            "ROIC% (ROA)":       roic,
             "ROE%":              roe,
             "Int Coverage":      ic,
             "Op Margin%":        om,
@@ -778,8 +741,8 @@ def build_screener_table(universe_df, fmp_quotes, fmp_ratios, fmp_income, moment
     scr["MC% of Nifty50"] = scr["Mkt Cap Raw"] / total_mc * 100.0 if total_mc > 0 else None
 
     num_cols = [
-        "Price (Rs)", "Mkt Cap (RsCr)", "P/E", "PEG", "52W Pos%",
-        "ROIC%", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
+        "Price (Rs)", "Mkt Cap (RsCr)", "P/E", "Fwd P/E", "PEG", "52W Pos%",
+        "ROIC% (ROA)", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
         "Quality Score", "Earn Traj", "Momentum Score",
         "Ret 1Mo%", "Ret 3Mo%", "Ret 6Mo%", "Trailing Vol%", "MC% of Nifty50",
         "Rev Q1 (RsCr)", "Rev Q2 (RsCr)", "Rev Q3 (RsCr)", "Rev Q4 (RsCr)",
@@ -835,7 +798,7 @@ def render_sector_kpi_panel(scr, sector_sel):
                      "trailing twelve months", "#facc15"), unsafe_allow_html=True)
     c5.markdown(_kpi("Median Quality",
                      "{:.0f}/100".format(med_qual) if pd.notna(med_qual) else "N/A",
-                     "ROIC+IntCov+Margin", "#4ade80"), unsafe_allow_html=True)
+                     "ROE+IntCov+Margin", "#4ade80"), unsafe_allow_html=True)
     c6.markdown(_kpi("Median PEG",
                      "{:.2f}".format(med_peg) if pd.notna(med_peg) else "N/A",
                      "price/earnings/growth", "#a78bfa"), unsafe_allow_html=True)
@@ -878,7 +841,7 @@ st.markdown(
 )
 
 st.markdown("## Nifty 50 Fundamental Screener")
-st.caption("FMP API (bare symbols) + yfinance (.NS) · Wikipedia universe · 5-factor scoring · INR")
+st.caption("100% yfinance · No paid API required · Wikipedia universe · 5-factor scoring · INR")
 
 page_screener, page_about, page_debug = st.tabs(["Screener", "About", "Debug"])
 
@@ -886,82 +849,53 @@ page_screener, page_about, page_debug = st.tabs(["Screener", "About", "Debug"])
 # TAB 1 — SCREENER
 # ══════════════════════════════════════════════════════════════════════════════
 with page_screener:
-    fmp_key = get_fmp_key()
-    if not fmp_key:
-        st.error("FMP API key not configured.")
-        st.markdown(
-            "**How to add your FMP key:**\n"
-            "1. Get a free key at financialmodelingprep.com\n"
-            "2. Streamlit Cloud -> your app -> **Settings** -> **Secrets**\n"
-            "3. Add:\n"
-            "```toml\n"
-            "[fmp]\n"
-            'api_key = "your_key_here"\n'
-            "```"
-        )
-        st.stop()
-
     col_r, col_t = st.columns([1, 6])
     with col_r:
         if st.button("Refresh"):
             st.cache_data.clear()
             st.rerun()
     with col_t:
-        st.caption("Last loaded: {} · Prices: 1hr cache · Fundamentals: 24hr cache".format(
+        st.caption("Last loaded: {} · Prices+fundamentals: 1hr cache · Universe: 24hr cache".format(
             datetime.now().strftime("%I:%M %p")))
 
     with st.spinner("Loading universe from Wikipedia..."):
         universe_df = get_nifty50_universe()
+    tickers = tuple(universe_df["Ticker"].tolist())
 
-    with st.spinner("Resolving FMP symbols (probing API for correct symbol format)..."):
-        base_symbols   = tuple(universe_df["Base"].tolist())
-        fmp_symbol_map = resolve_fmp_symbols(base_symbols, fmp_key)
-        universe_df["FMP Symbol"] = universe_df["Base"].map(fmp_symbol_map)
+    with st.spinner("Fetching fundamentals from yfinance (price, PE, margins, EPS, revenue)..."):
+        yf_fundamentals = fetch_yf_fundamentals(tickers)
 
-    fmp_symbols = tuple(universe_df["FMP Symbol"].tolist())
-    yf_tickers  = tuple(universe_df["YF Ticker"].tolist())
+    with st.spinner("Fetching momentum data from yfinance (price history)..."):
+        momentum = fetch_momentum_batch(tickers)
 
-    with st.spinner("Fetching FMP quotes (price, PE, MC, 52W)..."):
-        fmp_quotes = fetch_fmp_quotes(fmp_symbols, fmp_key)
-
-    with st.spinner("Fetching FMP ratios (ROE, margins, ROIC, PEG)..."):
-        fmp_ratios = fetch_fmp_ratios(fmp_symbols, fmp_key)
-
-    with st.spinner("Fetching FMP income statements (EPS, revenue)..."):
-        fmp_income = fetch_fmp_income(fmp_symbols, fmp_key)
-
-    with st.spinner("Fetching momentum data (yfinance)..."):
-        momentum = fetch_momentum_batch(yf_tickers)
-
-    total_t   = len(fmp_symbols)
-    has_price = sum(1 for t in fmp_symbols if fmp_quotes.get(t, {}).get("price") is not None)
-    has_pe    = sum(1 for t in fmp_symbols if fmp_quotes.get(t, {}).get("pe")    is not None)
-    has_roe   = sum(1 for t in fmp_symbols if fmp_ratios.get(t, {}).get("roe")   is not None)
-    has_roic  = sum(1 for t in fmp_symbols if fmp_ratios.get(t, {}).get("roic")  is not None)
-    has_et    = sum(1 for t in fmp_symbols if fmp_income.get(t, {}).get("earn_traj") is not None)
-    has_mom   = sum(1 for t in yf_tickers  if momentum.get(t,  {}).get("momentum_score") is not None)
+    total_t   = len(tickers)
+    has_price = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("price") is not None)
+    has_pe    = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("pe")    is not None)
+    has_roe   = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("roe")   is not None)
+    has_om    = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("op_margin") is not None)
+    has_et    = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("earn_traj") is not None)
+    has_mom   = sum(1 for t in tickers if momentum.get(t, {}).get("momentum_score") is not None)
 
     coverage_color = "info" if has_price >= total_t * 0.7 else "warning"
     getattr(st, coverage_color)(
-        "Data coverage — "
+        "Data coverage (yfinance only) — "
         "Price: {}/{} ({:.0f}%) · P/E: {}/{} ({:.0f}%) · "
-        "ROE: {}/{} ({:.0f}%) · ROIC: {}/{} ({:.0f}%) · "
-        "Earn Traj: {}/{} ({:.0f}%) · Momentum: {}/{} ({:.0f}%) · "
-        "FMP symbols resolved via API probe".format(
+        "ROE: {}/{} ({:.0f}%) · Op Margin: {}/{} ({:.0f}%) · "
+        "Earn Traj: {}/{} ({:.0f}%) · Momentum: {}/{} ({:.0f}%)".format(
             has_price, total_t, has_price / total_t * 100,
             has_pe,    total_t, has_pe    / total_t * 100,
             has_roe,   total_t, has_roe   / total_t * 100,
-            has_roic,  total_t, has_roic  / total_t * 100,
+            has_om,    total_t, has_om    / total_t * 100,
             has_et,    total_t, has_et    / total_t * 100,
             has_mom,   total_t, has_mom   / total_t * 100,
         )
     )
 
     with st.spinner("Building screener table..."):
-        scr = build_screener_table(universe_df, fmp_quotes, fmp_ratios, fmp_income, momentum)
+        scr = build_screener_table(universe_df, yf_fundamentals, momentum)
 
     if scr.empty:
-        st.error("No data returned. Use the Debug tab to diagnose.")
+        st.error("No data returned. Check the Debug tab.")
         st.stop()
 
     st.markdown("### Filters")
@@ -972,9 +906,10 @@ with page_screener:
         sort_by     = fc2.selectbox("Sort by", [
             "Sector then Rank", "Score high to low", "Conviction high to low",
             "MC% of Nifty50 high to low", "Price low to high", "Price high to low",
-            "Mkt Cap high to low", "PE low to high", "PEG low to high",
-            "Quality Score high", "ROIC high to low", "Earn Traj high to low",
-            "Momentum Score high", "52W Pos low to high", "Rev Growth high to low",
+            "Mkt Cap high to low", "PE low to high", "Fwd PE low to high",
+            "PEG low to high", "Quality Score high", "ROE high to low",
+            "Earn Traj high to low", "Momentum Score high",
+            "52W Pos low to high", "Rev Growth high to low",
         ])
         pe_max   = fc3.number_input("Max PE",             value=9999,  step=10)
         peg_max  = fc4.number_input("Max PEG",            value=999.0, step=1.0)
@@ -982,7 +917,7 @@ with page_screener:
 
     with st.expander("Quality Filters", expanded=False):
         qc1, qc2, qc3, qc4 = st.columns(4)
-        roic_min_f = qc1.number_input("Min ROIC (%)",         value=0.0, step=5.0)
+        roe_min_f  = qc1.number_input("Min ROE (%)",          value=0.0, step=5.0)
         ic_min_f   = qc2.number_input("Min Int Coverage (x)", value=0.0, step=1.0)
         om_min_f   = qc3.number_input("Min Op Margin (%)",    value=0.0, step=5.0)
         qual_min_f = qc4.number_input("Min Quality Score",    value=0.0, step=5.0)
@@ -1000,7 +935,7 @@ with page_screener:
     filt = filt[(filt["Mkt Cap (RsCr)"].isna())  | (filt["Mkt Cap (RsCr)"]  >= mc_min_c)]
     filt = filt[(filt["P/E"].isna())              | (filt["P/E"]             <= pe_max)]
     filt = filt[(filt["PEG"].isna())              | (filt["PEG"]             <= peg_max)]
-    filt = filt[(filt["ROIC%"].isna())            | (filt["ROIC%"]           >= roic_min_f)]
+    filt = filt[(filt["ROE%"].isna())             | (filt["ROE%"]            >= roe_min_f)]
     filt = filt[(filt["Int Coverage"].isna())     | (filt["Int Coverage"]    >= ic_min_f)]
     filt = filt[(filt["Op Margin%"].isna())       | (filt["Op Margin%"]      >= om_min_f)]
     filt = filt[(filt["Quality Score"].isna())    | (filt["Quality Score"]   >= qual_min_f)]
@@ -1016,9 +951,10 @@ with page_screener:
         "Price high to low":          (["Price (Rs)"],           [False]),
         "Mkt Cap high to low":        (["Mkt Cap (RsCr)"],       [False]),
         "PE low to high":             (["P/E"],                  [True]),
+        "Fwd PE low to high":         (["Fwd P/E"],              [True]),
         "PEG low to high":            (["PEG"],                  [True]),
         "Quality Score high":         (["Quality Score"],        [False]),
-        "ROIC high to low":           (["ROIC%"],                [False]),
+        "ROE high to low":            (["ROE%"],                 [False]),
         "Earn Traj high to low":      (["Earn Traj"],            [False]),
         "Momentum Score high":        (["Momentum Score"],       [False]),
         "52W Pos low to high":        (["52W Pos%"],             [True]),
@@ -1032,8 +968,8 @@ with page_screener:
 
     disp = filt.copy()
     for c in [
-        "P/E", "PEG", "Earn Traj", "52W Pos%",
-        "ROIC%", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
+        "P/E", "Fwd P/E", "PEG", "Earn Traj", "52W Pos%",
+        "ROIC% (ROA)", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
         "Quality Score", "Momentum Score", "Ret 1Mo%", "Ret 3Mo%",
         "Ret 6Mo%", "Trailing Vol%", "Score", "Conviction Score",
         "Rev Growth% (YoY)", "MC% of Nifty50", "Price (Rs)", "Mkt Cap (RsCr)",
@@ -1044,7 +980,7 @@ with page_screener:
 
     disp["Quality Flag"] = disp.apply(
         lambda r: quality_flag(
-            r.get("ROIC%"), r.get("ROE%"),
+            r.get("ROIC% (ROA)"), r.get("ROE%"),
             r.get("Int Coverage"), r.get("Op Margin%"), r.get("Debt/Eq"),
         ), axis=1,
     )
@@ -1053,8 +989,8 @@ with page_screener:
     COLS = [
         "Ticker", "Sector",
         "Price (Rs)", "52W Pos%", "Mkt Cap (RsCr)", "MC% of Nifty50",
-        "P/E", "PEG", "PEG Method", "Earn Traj",
-        "ROIC%", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
+        "P/E", "Fwd P/E", "PEG", "PEG Method", "Earn Traj",
+        "ROIC% (ROA)", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
         "Quality Score", "Quality Flag",
         "Momentum Score", "Ret 1Mo%", "Ret 3Mo%", "Ret 6Mo%", "Trailing Vol%",
         "Score", "Conviction Score", "Rank",
@@ -1074,163 +1010,166 @@ with page_screener:
     st.markdown("---")
     st.markdown("**Column Glossary**")
     st.markdown(
-        "- **P/E**: TTM from FMP /quote; falls back to /ratios-ttm.\n"
-        "- **PEG**: < 1.0 potentially undervalued. Only when EPS growth >= 5%.\n"
-        "- **Earn Traj**: YoY EPS change clamped to [-1, +1]. Positive = growing.\n"
-        "- **ROIC% / ROE%**: Converted from FMP decimal (0.15 -> 15%).\n"
-        "- **Int Coverage**: Already a multiple, not converted. Capped at 100x.\n"
-        "- **Quality Score**: 0-100. None when all inputs missing.\n"
-        "- **Quality Flag**: ROIC/ROE < 8%, IntCov < 3x, Margin < 5% flagged.\n"
-        "- **52W Pos%**: 0% = 52W low, 100% = 52W high.\n"
-        "- **Rev Growth% (YoY)**: Newest quarter vs same quarter prior year.\n"
+        "- **P/E**: Trailing twelve months P/E from yfinance `trailingPE`.\n"
+        "- **Fwd P/E**: Forward P/E from yfinance `forwardPE` (analyst consensus).\n"
+        "- **PEG**: From yfinance `pegRatio` if available; else Fwd P/E / EPS growth. Only when EPS growth >= 5%.\n"
+        "- **Earn Traj**: YoY EPS change from quarterly financials, clamped to [-1, +1].\n"
+        "- **ROIC% (ROA)**: Return on Assets from yfinance used as ROIC proxy (converted from decimal).\n"
+        "- **ROE%**: Return on Equity from yfinance (converted from decimal).\n"
+        "- **Int Coverage**: EBITDA / Interest Expense derived from yfinance info fields.\n"
+        "- **Op Margin%**: Operating margin from yfinance (converted from decimal).\n"
+        "- **Debt/Eq**: Debt-to-equity from yfinance `debtToEquity` (already a ratio).\n"
+        "- **Quality Score**: 0-100 composite of ROE/ROIC + Int Coverage + Op Margin. None when all missing.\n"
+        "- **Quality Flag**: Flags ROE/ROIC < 8%, IntCov < 3x, Margin < 5%.\n"
+        "- **52W Pos%**: Position in 52W range. 0% = low, 100% = high.\n"
         "- **Score**: Valuation 25% + Quality 25% + PEG 20% + Earn Traj 15% + Momentum 15%.\n"
-        "- **Rank**: Within-sector rank by Score (1 = best).\n"
+        "- **Rank**: Within-sector rank by Score (1 = best). Source: 100% yfinance, no paid API needed.\n"
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — ABOUT
 # ══════════════════════════════════════════════════════════════════════════════
 with page_about:
-    st.markdown("## About - Nifty 50 Screener v6")
+    st.markdown("## About - Nifty 50 Screener v7")
 
-    st.markdown("### Ticker Format by Source")
+    st.markdown("### Data Sources")
     st.markdown(
-        "| Source | Format | Example |\n"
+        "| Field | yfinance attribute | Notes |\n"
         "|---|---|---|\n"
-        "| FMP (quotes, ratios, income) | Bare symbol (resolved via API probe) | RELIANCE |\n"
-        "| yfinance (momentum) | TICKER.NS | RELIANCE.NS |\n"
-        "| Display | Base symbol | RELIANCE |\n"
+        "| Price | currentPrice / regularMarketPrice | INR |\n"
+        "| Market Cap | marketCap | INR |\n"
+        "| 52W High/Low | fiftyTwoWeekHigh / fiftyTwoWeekLow | INR |\n"
+        "| Trailing P/E | trailingPE | TTM |\n"
+        "| Forward P/E | forwardPE | Analyst consensus |\n"
+        "| PEG Ratio | pegRatio | Falls back to calculated |\n"
+        "| ROE | returnOnEquity | Decimal, converted to % |\n"
+        "| ROIC proxy | returnOnAssets | Decimal, converted to % |\n"
+        "| Op Margin | operatingMargins | Decimal, converted to % |\n"
+        "| Int Coverage | ebitda / interestExpense | Derived |\n"
+        "| Debt/Equity | debtToEquity | Ratio |\n"
+        "| EPS (quarterly) | quarterly_income_stmt | For Earn Traj |\n"
+        "| Revenue (quarterly) | quarterly_income_stmt | For Rev Growth |\n"
+        "| Momentum | yf.download() price history | 7-month window |\n"
+        "| Universe | Wikipedia NIFTY_50 page | Cached 24h |\n"
     )
 
-    st.markdown("### Data Architecture")
-    st.markdown(
-        "| Field | Source | Endpoint |\n"
-        "|---|---|---|\n"
-        "| Price, MC, 52W, Trailing P/E | FMP | /quote/{symbol} |\n"
-        "| PEG, ROE, ROIC, Op Margin, D/E, Int Coverage | FMP | /ratios-ttm/{symbol} |\n"
-        "| EPS, Revenue, Earn Traj | FMP | /income-statement?period=quarter |\n"
-        "| Momentum | yfinance | price history |\n"
-        "| Universe | Wikipedia | NIFTY_50 page |\n"
+    st.markdown("### No Paid API Required")
+    st.info(
+        "v7 removes the FMP dependency entirely. "
+        "FMP free tier does not cover Indian (NSE) stocks. "
+        "yfinance provides equivalent data for .NS tickers at no cost."
     )
 
     st.markdown("### Scoring Model")
     st.code(
-        "Score = 25% Valuation + 25% Quality + 20% PEG + 15% Earn Traj + 15% Momentum",
+        "Score = 25% Valuation (P/E percentile, lower = better)\n"
+        "      + 25% Quality   (ROE/ROIC + Int Coverage + Op Margin)\n"
+        "      + 20% PEG       (lower = better, only when EPS growth >= 5%)\n"
+        "      + 15% Earn Traj (YoY EPS direction, -1 to +1)\n"
+        "      + 15% Momentum  (6M-1M skip return / trailing volatility)",
         language=None,
+    )
+    st.markdown(
+        "All scores are sector-relative percentile ranks. "
+        "Missing data applies a penalty: -15% for 2 missing factors, -30% for 3+."
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — DEBUG
 # ══════════════════════════════════════════════════════════════════════════════
 with page_debug:
-    st.markdown("## Debug - API Diagnostics")
-    fmp_key_dbg = get_fmp_key()
+    st.markdown("## Debug - yfinance Diagnostics")
+    st.info("No API key required. All data comes from yfinance (.NS tickers).")
 
-    st.info(
-        "FMP Indian stock format: bare symbol with no exchange suffix. "
-        "Use 'RELIANCE', not 'RELIANCE.NS' or 'RELIANCE.NSE'. "
-        "The screener resolves the correct symbol automatically via FMP search."
-    )
-
-    col_a, col_b = st.columns(2)
-    test_base = col_a.text_input("Base symbol (no suffix)", value="RELIANCE")
-    test_yf   = yf_ticker(test_base.upper().strip())
-    col_b.markdown("**FMP symbol:** `{}`  |  **yfinance ticker:** `{}`".format(
-        test_base.upper().strip(), test_yf))
+    test_base = st.text_input("Base symbol (no suffix)", value="RELIANCE")
+    test_yf   = test_base.upper().strip() + ".NS"
+    st.markdown("**Testing ticker:** `{}`".format(test_yf))
 
     if st.button("Run diagnostic"):
-        if not fmp_key_dbg:
-            st.error("No FMP key found in Streamlit Secrets.")
-        else:
-            test_sym = test_base.upper().strip()
-            with st.spinner("Testing {}...".format(test_sym)):
+        with st.spinner("Testing {}...".format(test_yf)):
 
-                st.markdown("### 1. FMP /quote ({})".format(test_sym))
-                d = fmp_get("quote/{}".format(test_sym), fmp_key_dbg)
-                if d and isinstance(d, list) and len(d) > 0 and d[0].get("price"):
-                    item = d[0]
-                    st.success("/quote OK — symbol '{}' works on FMP".format(test_sym))
-                    st.json({k: item.get(k) for k in
-                             ["symbol", "price", "pe", "marketCap",
-                              "yearHigh", "yearLow", "name", "currency"]})
-                else:
-                    st.error("/quote empty for bare symbol '{}'".format(test_sym))
-                    st.markdown("Trying FMP search to find the correct symbol...")
-                    d2 = fmp_get("search", fmp_key_dbg,
-                                 params={"query": test_sym, "limit": "10", "exchange": "NSE"})
-                    if d2 and isinstance(d2, list) and len(d2) > 0:
-                        st.warning("FMP search results for '{}':".format(test_sym))
-                        st.json([{"symbol": x.get("symbol"),
-                                  "name": x.get("name"),
-                                  "exchange": x.get("exchangeShortName")}
-                                 for x in d2[:5]])
-                        st.info("Use the correct symbol from the search results above in the input box.")
-                    else:
-                        st.error(
-                            "Search also returned empty. Possible causes:\n"
-                            "1. FMP free tier does not cover Indian stocks for this key\n"
-                            "2. API key has exceeded rate limits\n"
-                            "3. FMP requires a paid plan for NSE data\n\n"
-                            "Verify at: https://financialmodelingprep.com/developer/docs/pricing"
-                        )
-
-                st.markdown("### 2. FMP /ratios-ttm ({})".format(test_sym))
-                d = fmp_get("ratios-ttm/{}".format(test_sym), fmp_key_dbg)
-                if d and isinstance(d, list) and len(d) > 0:
-                    item = d[0]
-                    st.success("/ratios-ttm OK")
-                    st.json({k: item.get(k) for k in [
-                        "returnOnEquityTTM", "returnOnInvestedCapitalTTM",
-                        "operatingProfitMarginTTM", "interestCoverageTTM",
-                        "priceEarningsGrowthRatioTTM", "priceToEarningsRatioTTM",
-                        "debtEquityRatioTTM",
+            st.markdown("### 1. yfinance .info (fundamentals)")
+            try:
+                t_obj = yf.Ticker(test_yf)
+                info  = t_obj.info or {}
+                if info.get("regularMarketPrice") or info.get("currentPrice"):
+                    st.success("yfinance .info OK")
+                    st.json({k: info.get(k) for k in [
+                        "shortName", "currentPrice", "marketCap",
+                        "trailingPE", "forwardPE", "pegRatio",
+                        "returnOnEquity", "returnOnAssets",
+                        "operatingMargins", "debtToEquity",
+                        "ebitda", "interestExpense",
+                        "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
+                        "trailingEps", "forwardEps",
                     ]})
-                    st.markdown("**Converted values:**")
-                    st.json({
-                        "ROIC%":                             decimal_to_pct(item.get("returnOnInvestedCapitalTTM")),
-                        "ROE%":                              decimal_to_pct(item.get("returnOnEquityTTM")),
-                        "Op Margin%":                        decimal_to_pct(item.get("operatingProfitMarginTTM")),
-                        "Int Coverage (raw, no conversion)": item.get("interestCoverageTTM"),
-                        "PEG":                               item.get("priceEarningsGrowthRatioTTM"),
-                    })
                 else:
-                    st.warning("/ratios-ttm empty for '{}' - may need paid FMP tier".format(test_sym))
+                    st.error("yfinance .info returned no price for {}".format(test_yf))
+                    st.json(dict(list(info.items())[:10]))
+            except Exception as ex:
+                st.error("yfinance .info error: {}".format(ex))
 
-                st.markdown("### 3. FMP /income-statement ({})".format(test_sym))
-                d = fmp_get(
-                    "income-statement/{}".format(test_sym), fmp_key_dbg,
-                    params={"period": "quarter", "limit": "5"},
-                )
-                if d and isinstance(d, list) and len(d) > 0:
-                    st.success("/income-statement OK - {} quarters".format(len(d)))
-                    st.json({k: d[0].get(k) for k in
-                             ["date", "revenue", "eps", "netIncome", "period"]})
+            st.markdown("### 2. yfinance quarterly income statement")
+            try:
+                t_obj = yf.Ticker(test_yf)
+                for attr in ("quarterly_income_stmt", "quarterly_financials"):
+                    df = getattr(t_obj, attr, None)
+                    if df is not None and not df.empty:
+                        st.success("{} OK — {} rows x {} quarters".format(
+                            attr, len(df), len(df.columns)))
+                        st.dataframe(df.head(6))
+                        break
                 else:
-                    st.error("/income-statement empty for '{}'".format(test_sym))
+                    st.warning("No quarterly income statement found for {}".format(test_yf))
+            except Exception as ex:
+                st.error("Quarterly financials error: {}".format(ex))
 
-                st.markdown("### 4. yfinance ({})".format(test_yf))
-                try:
-                    test_df = yf.download(test_yf, period="3mo", interval="1d",
-                                          auto_adjust=True, progress=False)
-                    if not test_df.empty:
-                        close_col = test_df["Close"]
-                        if isinstance(close_col, pd.DataFrame):
-                            close_col = close_col.iloc[:, 0]
-                        latest = float(pd.to_numeric(close_col, errors="coerce").dropna().iloc[-1])
-                        st.success("yfinance OK - {} rows, latest close: {:.2f}".format(
-                            len(test_df), latest))
-                    else:
-                        st.warning("yfinance empty for {}".format(test_yf))
-                except Exception as ex:
-                    st.error("yfinance error: {}".format(ex))
+            st.markdown("### 3. yfinance price history (momentum)")
+            try:
+                hist = yf.download(test_yf, period="3mo", interval="1d",
+                                   auto_adjust=True, progress=False)
+                if not hist.empty:
+                    close_col = hist["Close"]
+                    if isinstance(close_col, pd.DataFrame):
+                        close_col = close_col.iloc[:, 0]
+                    latest = float(pd.to_numeric(close_col, errors="coerce").dropna().iloc[-1])
+                    st.success("Price history OK — {} rows, latest close: {:.2f}".format(
+                        len(hist), latest))
+                else:
+                    st.warning("Price history empty for {}".format(test_yf))
+            except Exception as ex:
+                st.error("Price history error: {}".format(ex))
 
-                st.markdown("### 5. FMP plan check")
-                st.markdown(
-                    "Verify your plan covers Indian (NSE) stocks at: "
-                    "https://financialmodelingprep.com/developer/docs/pricing\n\n"
-                    "Free tier covers US stocks. NSE stocks may require the **Starter** plan (~$19/mo)."
-                )
-                st.code("Key prefix: {}...  Length: {}".format(
-                    fmp_key_dbg[:6] if len(fmp_key_dbg) > 6 else fmp_key_dbg,
-                    len(fmp_key_dbg),
-                ))
+            st.markdown("### 4. Computed metrics preview")
+            try:
+                t_obj = yf.Ticker(test_yf)
+                info  = t_obj.info or {}
+                rev4  = _quarterly_revenues(t_obj)
+                eps_r, eps_o = _quarterly_eps(t_obj)
+                et = None
+                if eps_r and eps_o and abs(eps_o) > 0.001:
+                    raw_et = (eps_r - eps_o) / abs(eps_o)
+                    et     = max(-1.0, min(1.0, raw_et / 2.0))
+                rg = revenue_growth_yoy(rev4)
+                roe  = decimal_to_pct(_extract_scalar(info, "returnOnEquity"))
+                roic = decimal_to_pct(_extract_scalar(info, "returnOnAssets"))
+                om   = decimal_to_pct(_extract_scalar(info, "operatingMargins"))
+                ebitda  = _extract_scalar(info, "ebitda")
+                int_exp = _extract_scalar(info, "interestExpense")
+                ic = None
+                if ebitda and int_exp and int_exp != 0:
+                    ic = min(abs(ebitda / int_exp), 100.0)
+                st.json({
+                    "Rev Q1 (newest)":  rev4[0],
+                    "Rev Q4 (1yr ago)": rev4[3],
+                    "Rev YoY Growth%":  rg,
+                    "EPS recent":       eps_r,
+                    "EPS 1yr ago":      eps_o,
+                    "Earn Traj":        et,
+                    "ROE%":             roe,
+                    "ROIC proxy (ROA%)": roic,
+                    "Op Margin%":       om,
+                    "Int Coverage":     ic,
+                })
+            except Exception as ex:
+                st.error("Computed metrics error: {}".format(ex))
