@@ -934,7 +934,7 @@ with page_screener:
     filt = scr.copy()
     if sector_sel != "All Sectors":
         filt = filt[filt["Sector"] == sector_sel]
-    filt = filt[(filt["Mkt Cap (₹LCr)"].isna())  | (filt["Mkt Cap (₹ L Cr)"]  >= mc_min_l)]
+    filt = filt[(filt["Mkt Cap (₹LCr)"].isna())  | (filt["Mkt Cap (₹LCr)"]  >= mc_min_l)]
     filt = filt[(filt["P/E"].isna())                | (filt["P/E"]               <= pe_max)]
     filt = filt[(filt["PEG"].isna())                | (filt["PEG"]               <= peg_max)]
     filt = filt[(filt["ROE%"].isna())               | (filt["ROE%"]              >= roe_min_f)]
