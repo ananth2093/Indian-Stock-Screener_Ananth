@@ -1,4 +1,4 @@
-# app.py  (Nifty 50 Screener v7 — yfinance only, no FMP dependency)
+# app.py  (Nifty 50 Screener v7 — display + data fixes)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -89,12 +89,11 @@ def sf(val):
         return None
 
 def fmt_mc_inr(val):
+    """Format market cap in Rs Lakh Cr for KPI panel."""
     if val is None or (isinstance(val, float) and pd.isna(val)) or val == 0:
         return "N/A"
-    cr = val / 1e7
-    if cr >= 100000:
-        return "Rs.{:.2f}L Cr".format(cr / 100000)
-    return "Rs.{:.0f}Cr".format(cr)
+    lakh_cr = val / 1e12        # 1 Lakh Cr = 10^12
+    return "Rs.{:.2f}L Cr".format(lakh_cr)
 
 def percentile_score(series, ascending=True):
     result = pd.Series(index=series.index, dtype=float)
@@ -140,7 +139,6 @@ def decimal_to_pct(val):
     return v
 
 def safe_float(obj):
-    """Extract a scalar float from a value that might be a pd.Series."""
     if obj is None:
         return None
     if isinstance(obj, pd.Series):
@@ -149,9 +147,22 @@ def safe_float(obj):
             return None
         obj = obj.iloc[0]
     try:
-        return float(obj)
+        f = float(obj)
+        return None if np.isnan(f) else f
     except Exception:
         return None
+
+def _extract_scalar(info, *keys, default=None):
+    for k in keys:
+        v = info.get(k)
+        if v is not None:
+            try:
+                f = float(v)
+                if not np.isnan(f):
+                    return f
+            except Exception:
+                pass
+    return default
 
 # ─── Universe ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
@@ -210,9 +221,9 @@ def get_nifty50_universe():
                         gics = gics_name
                         break
             data.append({
-                "Base":      raw_t,
-                "Ticker":    raw_t + ".NS",
-                "Sector":    gics or raw_s,
+                "Base":       raw_t,
+                "Ticker":     raw_t + ".NS",
+                "Sector":     gics or raw_s,
                 "NSE Sector": raw_s,
             })
 
@@ -242,7 +253,7 @@ def get_nifty50_universe():
             ("HCLTECH",    "Information Technology"),
             ("ASIANPAINT", "Materials"),
             ("MARUTI",     "Consumer Discretionary"),
-            ("BAJFINANCE",  "Financials"),
+            ("BAJFINANCE", "Financials"),
             ("TITAN",      "Consumer Discretionary"),
             ("SUNPHARMA",  "Health Care"),
             ("ULTRACEMCO", "Materials"),
@@ -252,40 +263,23 @@ def get_nifty50_universe():
             for b, s in fallback
         ])
 
-# ─── yfinance fundamentals ────────────────────────────────────────────────────
-def _extract_scalar(info, *keys, default=None):
-    """Pull the first available key from a yfinance info dict as a float."""
-    for k in keys:
-        v = info.get(k)
-        if v is not None:
-            try:
-                f = float(v)
-                if not np.isnan(f):
-                    return f
-            except Exception:
-                pass
-    return default
-
+# ─── Quarterly financial helpers ──────────────────────────────────────────────
 def _quarterly_revenues(ticker_obj):
     """
-    Return last 4 quarterly revenues (newest first) from yfinance
-    quarterly_financials or quarterly_income_stmt.
-    Values in native currency (INR for .NS tickers).
+    Return last 4 quarterly revenues newest-first (raw INR values).
+    Tries quarterly_income_stmt then quarterly_financials.
     """
     for attr in ("quarterly_income_stmt", "quarterly_financials"):
         try:
             df = getattr(ticker_obj, attr)
             if df is None or df.empty:
                 continue
-            # Look for a Total Revenue row
-            for label in ["Total Revenue", "Revenue", "Net Revenue"]:
+            for label in ["Total Revenue", "Revenue", "Net Revenue", "Operating Revenue"]:
                 matches = [r for r in df.index if label.lower() in str(r).lower()]
                 if matches:
-                    row = df.loc[matches[0]]
-                    vals = []
-                    for col in sorted(row.index, reverse=True)[:4]:
-                        v = safe_float(row[col])
-                        vals.append(v)
+                    row  = df.loc[matches[0]]
+                    cols = sorted(row.index, reverse=True)[:4]
+                    vals = [safe_float(row[c]) for c in cols]
                     while len(vals) < 4:
                         vals.append(None)
                     return vals[:4]
@@ -294,7 +288,7 @@ def _quarterly_revenues(ticker_obj):
     return [None, None, None, None]
 
 def _quarterly_eps(ticker_obj):
-    """Return (eps_recent, eps_1yr_ago) from quarterly financials."""
+    """Return (eps_recent, eps_1yr_ago) from quarterly income statement."""
     for attr in ("quarterly_income_stmt", "quarterly_financials"):
         try:
             df = getattr(ticker_obj, attr)
@@ -310,14 +304,52 @@ def _quarterly_eps(ticker_obj):
                     return eps_r, eps_o
         except Exception:
             pass
-    # fallback: derive from net income / shares
     return None, None
 
+def _interest_coverage_from_financials(ticker_obj):
+    """
+    Derive interest coverage from annual income statement:
+    EBIT / InterestExpense.
+    More reliable than using the info dict fields.
+    """
+    for attr in ("income_stmt", "financials"):
+        try:
+            df = getattr(ticker_obj, attr)
+            if df is None or df.empty:
+                continue
+            ebit_row = None
+            int_row  = None
+            for label in ["EBIT", "Operating Income"]:
+                matches = [r for r in df.index if label.lower() in str(r).lower()]
+                if matches:
+                    ebit_row = df.loc[matches[0]]
+                    break
+            for label in ["Interest Expense", "Interest Expense Non Operating",
+                           "Net Interest Income", "Interest And Debt Expense"]:
+                matches = [r for r in df.index if label.lower() in str(r).lower()]
+                if matches:
+                    int_row = df.loc[matches[0]]
+                    break
+            if ebit_row is not None and int_row is not None:
+                cols = sorted(ebit_row.index, reverse=True)
+                for col in cols[:2]:           # use most recent annual period
+                    ebit = safe_float(ebit_row[col])
+                    iexp = safe_float(int_row[col])
+                    if ebit is not None and iexp is not None and iexp != 0:
+                        ic = ebit / abs(iexp)
+                        if ic > 0:
+                            return min(ic, 100.0)
+        except Exception:
+            pass
+    return None
+
+# ─── yfinance fundamentals ────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def fetch_yf_fundamentals(tickers):
     """
-    Fetch all fundamental data from yfinance for a tuple of .NS tickers.
-    Returns dict keyed by ticker with all fields needed for the screener.
+    Fetch all fundamental data from yfinance.
+    Interest coverage is derived from income statement (EBIT / InterestExpense)
+    which is far more reliable than the info dict fields.
     """
     out = {t: {} for t in tickers}
 
@@ -326,40 +358,33 @@ def fetch_yf_fundamentals(tickers):
             ticker_obj = yf.Ticker(t)
             info       = ticker_obj.info or {}
 
-            # ── Price / market data ──────────────────────────────────────────
-            price = _extract_scalar(info, "currentPrice", "regularMarketPrice",
-                                    "previousClose")
-            mc    = _extract_scalar(info, "marketCap")
-            hi52  = _extract_scalar(info, "fiftyTwoWeekHigh")
-            lo52  = _extract_scalar(info, "fiftyTwoWeekLow")
+            price  = _extract_scalar(info, "currentPrice", "regularMarketPrice", "previousClose")
+            mc     = _extract_scalar(info, "marketCap")
+            hi52   = _extract_scalar(info, "fiftyTwoWeekHigh")
+            lo52   = _extract_scalar(info, "fiftyTwoWeekLow")
+            pe     = _extract_scalar(info, "trailingPE")
+            fwd_pe = _extract_scalar(info, "forwardPE")
+            peg_yf = _extract_scalar(info, "pegRatio")
 
-            # ── Valuation ────────────────────────────────────────────────────
-            pe       = _extract_scalar(info, "trailingPE")
-            fwd_pe   = _extract_scalar(info, "forwardPE")
-            peg_yf   = _extract_scalar(info, "pegRatio")
-
-            # ── Quality / margins ────────────────────────────────────────────
             roe_raw  = _extract_scalar(info, "returnOnEquity")
-            roic_raw = _extract_scalar(info, "returnOnAssets")   # yf has no direct ROIC
+            roic_raw = _extract_scalar(info, "returnOnAssets")
             om_raw   = _extract_scalar(info, "operatingMargins")
-            gm_raw   = _extract_scalar(info, "grossMargins")
             de_raw   = _extract_scalar(info, "debtToEquity")
-            cr_raw   = _extract_scalar(info, "currentRatio")
 
-            # yf returns ROE/margins as decimals (0.15 = 15%)
             roe  = decimal_to_pct(roe_raw)
-            roic = decimal_to_pct(roic_raw)   # using ROA as proxy for ROIC
+            roic = decimal_to_pct(roic_raw)
             om   = decimal_to_pct(om_raw)
 
-            # Interest coverage: yfinance doesn't expose it directly
-            # Derive from ebitda / interestExpense if available
-            ebitda   = _extract_scalar(info, "ebitda")
-            int_exp  = _extract_scalar(info, "interestExpense")
-            ic = None
-            if ebitda is not None and int_exp is not None and int_exp != 0:
-                ic = min(abs(ebitda / int_exp), 100.0)
+            # ── Interest coverage: income statement is primary source ────────
+            ic = _interest_coverage_from_financials(ticker_obj)
+            # Fallback: info dict ebitda / interestExpense
+            if ic is None:
+                ebitda  = _extract_scalar(info, "ebitda")
+                int_exp = _extract_scalar(info, "interestExpense")
+                if ebitda is not None and int_exp is not None and int_exp != 0:
+                    ic = min(abs(ebitda / int_exp), 100.0)
 
-            # ── EPS growth ───────────────────────────────────────────────────
+            # ── EPS trajectory ───────────────────────────────────────────────
             eps_r, eps_o = _quarterly_eps(ticker_obj)
             earn_traj    = None
             eps_growth   = None
@@ -367,21 +392,19 @@ def fetch_yf_fundamentals(tickers):
                 raw        = (eps_r - eps_o) / abs(eps_o)
                 earn_traj  = max(-1.0, min(1.0, raw / 2.0))
                 eps_growth = raw * 100.0
-
-            # Fallback: use yf's own EPS trend fields
             if earn_traj is None:
                 eps_curr = _extract_scalar(info, "trailingEps")
                 eps_fwd  = _extract_scalar(info, "forwardEps")
                 if eps_curr is not None and eps_fwd is not None and abs(eps_curr) > 0.001:
-                    raw       = (eps_fwd - eps_curr) / abs(eps_curr)
-                    earn_traj = max(-1.0, min(1.0, raw / 2.0))
+                    raw        = (eps_fwd - eps_curr) / abs(eps_curr)
+                    earn_traj  = max(-1.0, min(1.0, raw / 2.0))
                     eps_growth = raw * 100.0
 
-            # ── Revenue (quarterly) ──────────────────────────────────────────
+            # ── Quarterly revenue ────────────────────────────────────────────
             rev4 = _quarterly_revenues(ticker_obj)
 
             # ── PEG ─────────────────────────────────────────────────────────
-            peg = None
+            peg        = None
             peg_method = "N/A"
             if peg_yf is not None and 0 < peg_yf <= 500:
                 peg        = peg_yf
@@ -397,27 +420,26 @@ def fetch_yf_fundamentals(tickers):
                 peg = None
 
             return t, {
-                "price":     price,
-                "mc":        mc,
-                "hi52":      hi52,
-                "lo52":      lo52,
-                "pe":        pe    if (pe    is not None and 0 < pe    <= 10000) else None,
-                "fwd_pe":    fwd_pe if (fwd_pe is not None and 0 < fwd_pe <= 10000) else None,
-                "peg":       peg,
+                "price":      price,
+                "mc":         mc,
+                "hi52":       hi52,
+                "lo52":       lo52,
+                "pe":         pe    if (pe    is not None and 0 < pe    <= 10000) else None,
+                "fwd_pe":     fwd_pe if (fwd_pe is not None and 0 < fwd_pe <= 10000) else None,
+                "peg":        peg,
                 "peg_method": peg_method,
-                "roe":       roe,
-                "roic":      roic,
-                "op_margin": om,
+                "roe":        roe,
+                "roic":       roic,
+                "op_margin":  om,
                 "int_coverage": ic,
-                "debt_eq":   de_raw,
-                "earn_traj": earn_traj,
+                "debt_eq":    de_raw,
+                "earn_traj":  earn_traj,
                 "eps_growth": eps_growth,
-                "rev4":      rev4,
+                "rev4":       rev4,
             }
-        except Exception as ex:
+        except Exception:
             return t, {}
 
-    # Process in batches with threading
     CHUNK  = 10
     SLEEP  = 0.5
     tl     = list(tickers)
@@ -440,117 +462,91 @@ def fetch_yf_fundamentals(tickers):
 # ─── Momentum ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def fetch_momentum_batch(tickers):
+    """
+    Fetch 7-month price history for momentum calculation.
+    Downloads individually (single-ticker mode) to avoid MultiIndex
+    issues with .NS tickers in bulk downloads.
+    """
     tl  = list(tickers)
     out = {t: {} for t in tl}
 
-    def _safe_series(obj, ticker):
-        if obj is None:
-            return pd.Series(dtype=float)
-        if isinstance(obj, pd.Series):
-            return pd.to_numeric(obj, errors="coerce").dropna()
-        if not isinstance(obj, pd.DataFrame) or obj.empty:
-            return pd.Series(dtype=float)
-        if isinstance(obj.columns, pd.MultiIndex):
-            try:
-                col = obj["Close"][ticker]
+    def _process_single(t):
+        try:
+            raw_d = yf.download(t, period="7mo", interval="1d",
+                                auto_adjust=True, progress=False)
+            raw_m = yf.download(t, period="7mo", interval="1mo",
+                                auto_adjust=True, progress=False)
+
+            def _get_close(df):
+                if df is None or df.empty:
+                    return pd.Series(dtype=float)
+                if isinstance(df.columns, pd.MultiIndex):
+                    try:
+                        col = df["Close"].iloc[:, 0]
+                    except Exception:
+                        return pd.Series(dtype=float)
+                else:
+                    col = df.get("Close", pd.Series(dtype=float))
                 if isinstance(col, pd.DataFrame):
                     col = col.iloc[:, 0]
                 return pd.to_numeric(col, errors="coerce").dropna()
-            except (KeyError, TypeError):
-                pass
-            try:
-                close_cols = [(l0, l1) for l0, l1 in obj.columns if str(l0) == "Close"]
-                if close_cols:
-                    col = obj[close_cols[0]]
-                    if isinstance(col, pd.DataFrame):
-                        col = col.iloc[:, 0]
-                    return pd.to_numeric(col, errors="coerce").dropna()
-            except Exception:
-                pass
-            return pd.Series(dtype=float)
-        if "Close" in obj.columns:
-            col = obj["Close"]
-            if isinstance(col, pd.DataFrame):
-                col = col.iloc[:, 0]
-            return pd.to_numeric(col, errors="coerce").dropna()
-        return pd.Series(dtype=float)
 
-    def _process_batch(batch):
-        try:
-            if len(batch) == 1:
-                raw_d = yf.download(batch[0], period="7mo", interval="1d",
-                                    auto_adjust=True, progress=False)
-                raw_m = yf.download(batch[0], period="7mo", interval="1mo",
-                                    auto_adjust=True, progress=False)
-            else:
-                raw_d = yf.download(batch, period="7mo", interval="1d",
-                                    group_by="ticker", auto_adjust=True,
-                                    progress=False, threads=True)
-                raw_m = yf.download(batch, period="7mo", interval="1mo",
-                                    group_by="ticker", auto_adjust=True,
-                                    progress=False, threads=True)
+            closes_d = _get_close(raw_d)
+            closes_m = _get_close(raw_m)
+
+            if len(closes_m) < 2:
+                return t, {}
+
+            px_now = float(closes_m.iloc[-1])
+
+            def ret_mo(n):
+                idx = -(n + 1)
+                if abs(idx) > len(closes_m):
+                    return None
+                px = float(closes_m.iloc[idx])
+                return (px_now / px - 1) * 100.0 if px > 0 else None
+
+            r1 = ret_mo(1)
+            r3 = ret_mo(3)
+            r6 = ret_mo(6)
+
+            trailing_vol = None
+            if len(closes_d) >= 20:
+                dr = closes_d.pct_change().dropna().tail(90)
+                if len(dr) >= 15:
+                    trailing_vol = float(dr.std() * np.sqrt(252) * 100.0)
+
+            skip = (r6 - r1) if (r6 is not None and r1 is not None) else None
+            mom  = None
+            if skip is not None and trailing_vol and trailing_vol > 0:
+                mom = skip / trailing_vol
+            elif skip is not None:
+                mom = skip
+
+            return t, {
+                "ret_1mo": r1, "ret_3mo": r3, "ret_6mo": r6,
+                "trailing_vol": trailing_vol, "momentum_score": mom,
+            }
         except Exception:
-            return {}
+            return t, {}
 
-        result = {}
-        for t in batch:
-            try:
-                if len(batch) == 1:
-                    closes_d = _safe_series(raw_d, t)
-                    closes_m = _safe_series(raw_m, t)
-                else:
-                    try:
-                        td = raw_d[t] if t in raw_d.columns.get_level_values(1) else raw_d
-                        tm = raw_m[t] if t in raw_m.columns.get_level_values(1) else raw_m
-                    except Exception:
-                        td, tm = raw_d, raw_m
-                    closes_d = _safe_series(td, t)
-                    closes_m = _safe_series(tm, t)
-
-                if len(closes_m) < 2:
-                    continue
-
-                px_now = float(closes_m.iloc[-1])
-
-                def ret_mo(n):
-                    idx = -(n + 1)
-                    if abs(idx) > len(closes_m):
-                        return None
-                    val = closes_m.iloc[idx]
-                    px  = float(val) if not isinstance(val, pd.Series) else float(val.iloc[0])
-                    return (px_now / px - 1) * 100.0 if px > 0 else None
-
-                r1 = ret_mo(1)
-                r3 = ret_mo(3)
-                r6 = ret_mo(6)
-
-                trailing_vol = None
-                if len(closes_d) >= 20:
-                    dr = closes_d.pct_change().dropna().tail(90)
-                    if len(dr) >= 15:
-                        trailing_vol = float(dr.std() * np.sqrt(252) * 100.0)
-
-                skip = (r6 - r1) if (r6 is not None and r1 is not None) else None
-                mom  = None
-                if skip is not None and trailing_vol and trailing_vol > 0:
-                    mom = skip / trailing_vol
-                elif skip is not None:
-                    mom = skip
-
-                result[t] = {
-                    "ret_1mo": r1, "ret_3mo": r3, "ret_6mo": r6,
-                    "trailing_vol": trailing_vol, "momentum_score": mom,
-                }
-            except Exception:
-                pass
-        return result
-
-    BATCH_SIZE = 15
-    batches    = [tl[i:i + BATCH_SIZE] for i in range(0, len(tl), BATCH_SIZE)]
-    for i, batch in enumerate(batches):
-        out.update(_process_batch(batch))
-        if i < len(batches) - 1:
-            time.sleep(0.5)
+    # Process in chunks with threading — individual downloads per ticker
+    CHUNK  = 10
+    SLEEP  = 0.5
+    chunks = [tl[i:i + CHUNK] for i in range(0, len(tl), CHUNK)]
+    prog   = st.progress(0)
+    stat   = st.empty()
+    for ci, chunk in enumerate(chunks):
+        stat.text("yfinance momentum: {}/{} tickers...".format(
+            min(ci * CHUNK, len(tl)), len(tl)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            for t, d in ex.map(_process_single, chunk):
+                out[t] = d
+        prog.progress((ci + 1) / len(chunks))
+        if ci < len(chunks) - 1:
+            time.sleep(SLEEP)
+    prog.empty()
+    stat.empty()
     return out
 
 # ─── Quality ──────────────────────────────────────────────────────────────────
@@ -657,7 +653,7 @@ def compute_conviction_scores(scr):
 def build_screener_table(universe_df, yf_fundamentals, momentum_map):
     rows = []
     for _, r in universe_df.iterrows():
-        t   = r["Ticker"]
+        t    = r["Ticker"]
         base = r["Base"]
         sec  = r["Sector"]
 
@@ -671,7 +667,6 @@ def build_screener_table(universe_df, yf_fundamentals, momentum_map):
         pe     = to_num(fd.get("pe"))
         fwd_pe = to_num(fd.get("fwd_pe"))
         peg    = to_num(fd.get("peg"))
-        peg_method = fd.get("peg_method", "N/A")
         roic   = to_num(fd.get("roic"))
         roe    = to_num(fd.get("roe"))
         ic     = to_num(fd.get("int_coverage"))
@@ -701,36 +696,43 @@ def build_screener_table(universe_df, yf_fundamentals, momentum_map):
         mom_score = to_num(mom.get("momentum_score"))
         t_vol     = to_num(mom.get("trailing_vol"))
 
+        # ── Unit conversions ─────────────────────────────────────────────────
+        # Market Cap: raw bytes → Rs Lakh Cr  (1 Lakh Cr = 1e12)
+        mc_lakh_cr = (mc / 1e12) if mc is not None else None
+
+        # Revenue quarters: raw INR → Rs Thousand Cr  (1 Thousand Cr = 1e11)
+        def to_tcr(v):
+            return (float(v) / 1e11) if (v is not None and pd.notna(v)) else None
+
         rows.append({
-            "Ticker":            base,
-            "YF Ticker":         t,
-            "Sector":            sec,
-            "Price (Rs)":        price,
-            "Mkt Cap (RsCr)":    (mc / 1e7) if mc is not None else None,
-            "Mkt Cap Raw":       mc,
-            "P/E":               pe,
-            "Fwd P/E":           fwd_pe,
-            "PEG":               peg,
-            "PEG Method":        peg_method,
-            "Earn Traj":         earn_traj,
-            "52W Pos%":          to_num(pos52),
-            "ROIC% (ROA)":       roic,
-            "ROE%":              roe,
-            "Int Coverage":      ic,
-            "Op Margin%":        om,
-            "Debt/Eq":           de,
-            "Quality Score":     to_num(q_score) if q_score is not None else None,
-            "Momentum Score":    mom_score,
-            "Ret 1Mo%":          ret_1mo,
-            "Ret 3Mo%":          ret_3mo,
-            "Ret 6Mo%":          ret_6mo,
-            "Trailing Vol%":     t_vol,
-            "Eligible":          True,
-            "Rev Q1 (RsCr)":     (rq1 / 1e7) if rq1 is not None else None,
-            "Rev Q2 (RsCr)":     (rq2 / 1e7) if rq2 is not None else None,
-            "Rev Q3 (RsCr)":     (rq3 / 1e7) if rq3 is not None else None,
-            "Rev Q4 (RsCr)":     (rq4 / 1e7) if rq4 is not None else None,
-            "Rev Growth% (YoY)": to_num(growth),
+            "Ticker":             base,
+            "YF Ticker":          t,
+            "Sector":             sec,
+            "Price (Rs)":         price,
+            "Mkt Cap (Rs LCr)":   mc_lakh_cr,
+            "Mkt Cap Raw":        mc,
+            "P/E":                pe,
+            "Fwd P/E":            fwd_pe,
+            "PEG":                peg,
+            "Earn Traj":          earn_traj,
+            "52W Pos%":           to_num(pos52),
+            "ROIC% (ROA)":        roic,
+            "ROE%":               roe,
+            "Int Coverage":       ic,
+            "Op Margin%":         om,
+            "Debt/Eq":            de,
+            "Quality Score":      to_num(q_score) if q_score is not None else None,
+            "Momentum Score":     mom_score,
+            "Ret 1Mo%":           ret_1mo,
+            "Ret 3Mo%":           ret_3mo,
+            "Ret 6Mo%":           ret_6mo,
+            "Trailing Vol%":      t_vol,
+            "Eligible":           True,
+            "Rev Q1 (Rs TCr)":    to_tcr(rq1),
+            "Rev Q2 (Rs TCr)":    to_tcr(rq2),
+            "Rev Q3 (Rs TCr)":    to_tcr(rq3),
+            "Rev Q4 (Rs TCr)":    to_tcr(rq4),
+            "Rev Growth% (YoY)":  to_num(growth),
         })
 
     scr = pd.DataFrame(rows)
@@ -741,11 +743,11 @@ def build_screener_table(universe_df, yf_fundamentals, momentum_map):
     scr["MC% of Nifty50"] = scr["Mkt Cap Raw"] / total_mc * 100.0 if total_mc > 0 else None
 
     num_cols = [
-        "Price (Rs)", "Mkt Cap (RsCr)", "P/E", "Fwd P/E", "PEG", "52W Pos%",
+        "Price (Rs)", "Mkt Cap (Rs LCr)", "P/E", "Fwd P/E", "PEG", "52W Pos%",
         "ROIC% (ROA)", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
         "Quality Score", "Earn Traj", "Momentum Score",
         "Ret 1Mo%", "Ret 3Mo%", "Ret 6Mo%", "Trailing Vol%", "MC% of Nifty50",
-        "Rev Q1 (RsCr)", "Rev Q2 (RsCr)", "Rev Q3 (RsCr)", "Rev Q4 (RsCr)",
+        "Rev Q1 (Rs TCr)", "Rev Q2 (Rs TCr)", "Rev Q3 (Rs TCr)", "Rev Q4 (Rs TCr)",
         "Rev Growth% (YoY)",
     ]
     for c in num_cols:
@@ -790,8 +792,8 @@ def render_sector_kpi_panel(scr, sector_sel):
     )
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.markdown(_kpi("Sector Mkt Cap",   fmt_mc_inr(sec_mc),   "sector total"),        unsafe_allow_html=True)
-    c2.markdown(_kpi("Nifty 50 Mkt Cap", fmt_mc_inr(total_mc), "all 50 stocks"),       unsafe_allow_html=True)
+    c1.markdown(_kpi("Sector Mkt Cap",   fmt_mc_inr(sec_mc),   "Rs Lakh Cr"),          unsafe_allow_html=True)
+    c2.markdown(_kpi("Nifty 50 Mkt Cap", fmt_mc_inr(total_mc), "Rs Lakh Cr"),          unsafe_allow_html=True)
     c3.markdown(_kpi("Sector Share",     "{:.1f}%".format(pct), "{} stocks".format(len(sdata))), unsafe_allow_html=True)
     c4.markdown(_kpi("Median P/E",
                      "{:.1f}".format(med_pe) if pd.notna(med_pe) else "N/A",
@@ -862,30 +864,30 @@ with page_screener:
         universe_df = get_nifty50_universe()
     tickers = tuple(universe_df["Ticker"].tolist())
 
-    with st.spinner("Fetching fundamentals from yfinance (price, PE, margins, EPS, revenue)..."):
+    with st.spinner("Fetching fundamentals from yfinance (price, PE, margins, EPS, revenue, interest coverage)..."):
         yf_fundamentals = fetch_yf_fundamentals(tickers)
 
-    with st.spinner("Fetching momentum data from yfinance (price history)..."):
+    with st.spinner("Fetching momentum data from yfinance (individual price history downloads)..."):
         momentum = fetch_momentum_batch(tickers)
 
     total_t   = len(tickers)
-    has_price = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("price") is not None)
-    has_pe    = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("pe")    is not None)
-    has_roe   = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("roe")   is not None)
-    has_om    = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("op_margin") is not None)
-    has_et    = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("earn_traj") is not None)
-    has_mom   = sum(1 for t in tickers if momentum.get(t, {}).get("momentum_score") is not None)
+    has_price = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("price")        is not None)
+    has_pe    = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("pe")            is not None)
+    has_roe   = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("roe")           is not None)
+    has_ic    = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("int_coverage")  is not None)
+    has_et    = sum(1 for t in tickers if yf_fundamentals.get(t, {}).get("earn_traj")     is not None)
+    has_mom   = sum(1 for t in tickers if momentum.get(t, {}).get("momentum_score")       is not None)
 
     coverage_color = "info" if has_price >= total_t * 0.7 else "warning"
     getattr(st, coverage_color)(
         "Data coverage (yfinance only) — "
         "Price: {}/{} ({:.0f}%) · P/E: {}/{} ({:.0f}%) · "
-        "ROE: {}/{} ({:.0f}%) · Op Margin: {}/{} ({:.0f}%) · "
+        "ROE: {}/{} ({:.0f}%) · Int Coverage: {}/{} ({:.0f}%) · "
         "Earn Traj: {}/{} ({:.0f}%) · Momentum: {}/{} ({:.0f}%)".format(
             has_price, total_t, has_price / total_t * 100,
             has_pe,    total_t, has_pe    / total_t * 100,
             has_roe,   total_t, has_roe   / total_t * 100,
-            has_om,    total_t, has_om    / total_t * 100,
+            has_ic,    total_t, has_ic    / total_t * 100,
             has_et,    total_t, has_et    / total_t * 100,
             has_mom,   total_t, has_mom   / total_t * 100,
         )
@@ -911,9 +913,9 @@ with page_screener:
             "Earn Traj high to low", "Momentum Score high",
             "52W Pos low to high", "Rev Growth high to low",
         ])
-        pe_max   = fc3.number_input("Max PE",             value=9999,  step=10)
-        peg_max  = fc4.number_input("Max PEG",            value=999.0, step=1.0)
-        mc_min_c = fc5.number_input("Min Mkt Cap (RsCr)", value=0,     step=5000)
+        pe_max   = fc3.number_input("Max PE",              value=9999,  step=10)
+        peg_max  = fc4.number_input("Max PEG",             value=999.0, step=1.0)
+        mc_min_l = fc5.number_input("Min Mkt Cap (Rs LCr)", value=0.0,   step=1.0)
 
     with st.expander("Quality Filters", expanded=False):
         qc1, qc2, qc3, qc4 = st.columns(4)
@@ -932,15 +934,15 @@ with page_screener:
     filt = scr.copy()
     if sector_sel != "All Sectors":
         filt = filt[filt["Sector"] == sector_sel]
-    filt = filt[(filt["Mkt Cap (RsCr)"].isna())  | (filt["Mkt Cap (RsCr)"]  >= mc_min_c)]
-    filt = filt[(filt["P/E"].isna())              | (filt["P/E"]             <= pe_max)]
-    filt = filt[(filt["PEG"].isna())              | (filt["PEG"]             <= peg_max)]
-    filt = filt[(filt["ROE%"].isna())             | (filt["ROE%"]            >= roe_min_f)]
-    filt = filt[(filt["Int Coverage"].isna())     | (filt["Int Coverage"]    >= ic_min_f)]
-    filt = filt[(filt["Op Margin%"].isna())       | (filt["Op Margin%"]      >= om_min_f)]
-    filt = filt[(filt["Quality Score"].isna())    | (filt["Quality Score"]   >= qual_min_f)]
-    filt = filt[(filt["Momentum Score"].isna())   | (filt["Momentum Score"]  >= mom_min)]
-    filt = filt[(filt["Earn Traj"].isna())        | (filt["Earn Traj"]       >= et_min)]
+    filt = filt[(filt["Mkt Cap (Rs LCr)"].isna())  | (filt["Mkt Cap (Rs LCr)"]  >= mc_min_l)]
+    filt = filt[(filt["P/E"].isna())                | (filt["P/E"]               <= pe_max)]
+    filt = filt[(filt["PEG"].isna())                | (filt["PEG"]               <= peg_max)]
+    filt = filt[(filt["ROE%"].isna())               | (filt["ROE%"]              >= roe_min_f)]
+    filt = filt[(filt["Int Coverage"].isna())       | (filt["Int Coverage"]      >= ic_min_f)]
+    filt = filt[(filt["Op Margin%"].isna())         | (filt["Op Margin%"]        >= om_min_f)]
+    filt = filt[(filt["Quality Score"].isna())      | (filt["Quality Score"]     >= qual_min_f)]
+    filt = filt[(filt["Momentum Score"].isna())     | (filt["Momentum Score"]    >= mom_min)]
+    filt = filt[(filt["Earn Traj"].isna())          | (filt["Earn Traj"]         >= et_min)]
 
     sort_map = {
         "Sector then Rank":           (["Sector", "Rank"],       [True,  True]),
@@ -949,7 +951,7 @@ with page_screener:
         "MC% of Nifty50 high to low": (["MC% of Nifty50"],      [False]),
         "Price low to high":          (["Price (Rs)"],           [True]),
         "Price high to low":          (["Price (Rs)"],           [False]),
-        "Mkt Cap high to low":        (["Mkt Cap (RsCr)"],       [False]),
+        "Mkt Cap high to low":        (["Mkt Cap (Rs LCr)"],     [False]),
         "PE low to high":             (["P/E"],                  [True]),
         "Fwd PE low to high":         (["Fwd P/E"],              [True]),
         "PEG low to high":            (["PEG"],                  [True]),
@@ -972,8 +974,9 @@ with page_screener:
         "ROIC% (ROA)", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
         "Quality Score", "Momentum Score", "Ret 1Mo%", "Ret 3Mo%",
         "Ret 6Mo%", "Trailing Vol%", "Score", "Conviction Score",
-        "Rev Growth% (YoY)", "MC% of Nifty50", "Price (Rs)", "Mkt Cap (RsCr)",
-        "Rev Q1 (RsCr)", "Rev Q2 (RsCr)", "Rev Q3 (RsCr)", "Rev Q4 (RsCr)",
+        "Rev Growth% (YoY)", "MC% of Nifty50", "Price (Rs)",
+        "Mkt Cap (Rs LCr)",
+        "Rev Q1 (Rs TCr)", "Rev Q2 (Rs TCr)", "Rev Q3 (Rs TCr)", "Rev Q4 (Rs TCr)",
     ]:
         if c in disp.columns:
             disp[c] = disp[c].round(2)
@@ -986,15 +989,16 @@ with page_screener:
     )
     disp["Rank"] = disp["Rank"].apply(lambda v: int(v) if pd.notna(v) else pd.NA)
 
+    # PEG Method column intentionally excluded from display
     COLS = [
         "Ticker", "Sector",
-        "Price (Rs)", "52W Pos%", "Mkt Cap (RsCr)", "MC% of Nifty50",
-        "P/E", "Fwd P/E", "PEG", "PEG Method", "Earn Traj",
+        "Price (Rs)", "52W Pos%", "Mkt Cap (Rs LCr)", "MC% of Nifty50",
+        "P/E", "Fwd P/E", "PEG", "Earn Traj",
         "ROIC% (ROA)", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
         "Quality Score", "Quality Flag",
         "Momentum Score", "Ret 1Mo%", "Ret 3Mo%", "Ret 6Mo%", "Trailing Vol%",
         "Score", "Conviction Score", "Rank",
-        "Rev Q1 (RsCr)", "Rev Q2 (RsCr)", "Rev Q3 (RsCr)", "Rev Q4 (RsCr)",
+        "Rev Q1 (Rs TCr)", "Rev Q2 (Rs TCr)", "Rev Q3 (Rs TCr)", "Rev Q4 (Rs TCr)",
         "Rev Growth% (YoY)",
     ]
     disp_final = disp[[c for c in COLS if c in disp.columns]].copy()
@@ -1010,20 +1014,23 @@ with page_screener:
     st.markdown("---")
     st.markdown("**Column Glossary**")
     st.markdown(
-        "- **P/E**: Trailing twelve months P/E from yfinance `trailingPE`.\n"
-        "- **Fwd P/E**: Forward P/E from yfinance `forwardPE` (analyst consensus).\n"
-        "- **PEG**: From yfinance `pegRatio` if available; else Fwd P/E / EPS growth. Only when EPS growth >= 5%.\n"
-        "- **Earn Traj**: YoY EPS change from quarterly financials, clamped to [-1, +1].\n"
-        "- **ROIC% (ROA)**: Return on Assets from yfinance used as ROIC proxy (converted from decimal).\n"
-        "- **ROE%**: Return on Equity from yfinance (converted from decimal).\n"
-        "- **Int Coverage**: EBITDA / Interest Expense derived from yfinance info fields.\n"
-        "- **Op Margin%**: Operating margin from yfinance (converted from decimal).\n"
-        "- **Debt/Eq**: Debt-to-equity from yfinance `debtToEquity` (already a ratio).\n"
-        "- **Quality Score**: 0-100 composite of ROE/ROIC + Int Coverage + Op Margin. None when all missing.\n"
-        "- **Quality Flag**: Flags ROE/ROIC < 8%, IntCov < 3x, Margin < 5%.\n"
-        "- **52W Pos%**: Position in 52W range. 0% = low, 100% = high.\n"
-        "- **Score**: Valuation 25% + Quality 25% + PEG 20% + Earn Traj 15% + Momentum 15%.\n"
-        "- **Rank**: Within-sector rank by Score (1 = best). Source: 100% yfinance, no paid API needed.\n"
+        "- **Mkt Cap (Rs LCr)**: Market cap in Rs Lakh Crore (1 LCr = Rs 1,00,000 Cr = 10^12).\n"
+        "- **Rev Q1-Q4 (Rs TCr)**: Quarterly revenue in Rs Thousand Crore (1 TCr = Rs 1,000 Cr = 10^11).\n"
+        "- **P/E**: Trailing twelve months P/E from yfinance trailingPE.\n"
+        "- **Fwd P/E**: Forward P/E from yfinance forwardPE (analyst consensus).\n"
+        "- **PEG**: From yfinance pegRatio if available; else calculated from Fwd P/E / EPS growth.\n"
+        "- **Earn Traj**: YoY EPS change from quarterly income statement, clamped to [-1, +1].\n"
+        "- **ROIC% (ROA)**: Return on Assets used as ROIC proxy (decimal converted to %).\n"
+        "- **ROE%**: Return on Equity (decimal converted to %).\n"
+        "- **Int Coverage**: EBIT / Interest Expense from annual income statement. Capped at 100x.\n"
+        "- **Op Margin%**: Operating margin (decimal converted to %).\n"
+        "- **Debt/Eq**: Debt-to-equity ratio from yfinance debtToEquity.\n"
+        "- **Quality Score**: 0-100 composite of ROE/ROIC + Int Coverage + Op Margin.\n"
+        "- **Momentum Score**: (6M return - 1M return) / trailing annualised volatility.\n"
+        "- **Ret 1/3/6 Mo%**: Price returns over 1, 3, and 6 months.\n"
+        "- **Trailing Vol%**: Annualised daily return std dev over last 90 trading days.\n"
+        "- **Score**: Sector-relative percentile. Valuation 25% + Quality 25% + PEG 20% + Earn Traj 15% + Momentum 15%.\n"
+        "- **Rank**: Within-sector rank by Score (1 = best).\n"
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1034,30 +1041,23 @@ with page_about:
 
     st.markdown("### Data Sources")
     st.markdown(
-        "| Field | yfinance attribute | Notes |\n"
+        "| Field | yfinance source | Unit in table |\n"
         "|---|---|---|\n"
-        "| Price | currentPrice / regularMarketPrice | INR |\n"
-        "| Market Cap | marketCap | INR |\n"
-        "| 52W High/Low | fiftyTwoWeekHigh / fiftyTwoWeekLow | INR |\n"
-        "| Trailing P/E | trailingPE | TTM |\n"
-        "| Forward P/E | forwardPE | Analyst consensus |\n"
-        "| PEG Ratio | pegRatio | Falls back to calculated |\n"
-        "| ROE | returnOnEquity | Decimal, converted to % |\n"
-        "| ROIC proxy | returnOnAssets | Decimal, converted to % |\n"
-        "| Op Margin | operatingMargins | Decimal, converted to % |\n"
-        "| Int Coverage | ebitda / interestExpense | Derived |\n"
-        "| Debt/Equity | debtToEquity | Ratio |\n"
-        "| EPS (quarterly) | quarterly_income_stmt | For Earn Traj |\n"
-        "| Revenue (quarterly) | quarterly_income_stmt | For Rev Growth |\n"
-        "| Momentum | yf.download() price history | 7-month window |\n"
-        "| Universe | Wikipedia NIFTY_50 page | Cached 24h |\n"
-    )
-
-    st.markdown("### No Paid API Required")
-    st.info(
-        "v7 removes the FMP dependency entirely. "
-        "FMP free tier does not cover Indian (NSE) stocks. "
-        "yfinance provides equivalent data for .NS tickers at no cost."
+        "| Price | currentPrice / regularMarketPrice | Rs |\n"
+        "| Market Cap | marketCap | Rs Lakh Cr |\n"
+        "| 52W High/Low | fiftyTwoWeekHigh/Low | Rs |\n"
+        "| Trailing P/E | trailingPE | x |\n"
+        "| Forward P/E | forwardPE | x |\n"
+        "| PEG | pegRatio (or calculated) | x |\n"
+        "| ROE | returnOnEquity (decimal to %) | % |\n"
+        "| ROIC proxy | returnOnAssets (decimal to %) | % |\n"
+        "| Op Margin | operatingMargins (decimal to %) | % |\n"
+        "| Int Coverage | EBIT/InterestExpense from income_stmt | x |\n"
+        "| Debt/Equity | debtToEquity | ratio |\n"
+        "| EPS (quarterly) | quarterly_income_stmt | for Earn Traj |\n"
+        "| Revenue (quarterly) | quarterly_income_stmt | Rs Thousand Cr |\n"
+        "| Momentum | yf.download() price history | score |\n"
+        "| Universe | Wikipedia NIFTY_50 | cached 24h |\n"
     )
 
     st.markdown("### Scoring Model")
@@ -1069,17 +1069,13 @@ with page_about:
         "      + 15% Momentum  (6M-1M skip return / trailing volatility)",
         language=None,
     )
-    st.markdown(
-        "All scores are sector-relative percentile ranks. "
-        "Missing data applies a penalty: -15% for 2 missing factors, -30% for 3+."
-    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — DEBUG
 # ══════════════════════════════════════════════════════════════════════════════
 with page_debug:
     st.markdown("## Debug - yfinance Diagnostics")
-    st.info("No API key required. All data comes from yfinance (.NS tickers).")
+    st.info("No API key required. All data from yfinance (.NS tickers).")
 
     test_base = st.text_input("Base symbol (no suffix)", value="RELIANCE")
     test_yf   = test_base.upper().strip() + ".NS"
@@ -1105,11 +1101,26 @@ with page_debug:
                     ]})
                 else:
                     st.error("yfinance .info returned no price for {}".format(test_yf))
-                    st.json(dict(list(info.items())[:10]))
             except Exception as ex:
                 st.error("yfinance .info error: {}".format(ex))
 
-            st.markdown("### 2. yfinance quarterly income statement")
+            st.markdown("### 2. Annual income statement (interest coverage)")
+            try:
+                t_obj = yf.Ticker(test_yf)
+                for attr in ("income_stmt", "financials"):
+                    df = getattr(t_obj, attr, None)
+                    if df is not None and not df.empty:
+                        st.success("{} OK — {} rows".format(attr, len(df)))
+                        st.dataframe(df.head(8))
+                        ic = _interest_coverage_from_financials(t_obj)
+                        st.json({"Int Coverage (computed)": ic})
+                        break
+                else:
+                    st.warning("No annual income statement found")
+            except Exception as ex:
+                st.error("Annual income statement error: {}".format(ex))
+
+            st.markdown("### 3. Quarterly income statement (EPS, revenue)")
             try:
                 t_obj = yf.Ticker(test_yf)
                 for attr in ("quarterly_income_stmt", "quarterly_financials"):
@@ -1118,58 +1129,69 @@ with page_debug:
                         st.success("{} OK — {} rows x {} quarters".format(
                             attr, len(df), len(df.columns)))
                         st.dataframe(df.head(6))
+                        rev4  = _quarterly_revenues(t_obj)
+                        eps_r, eps_o = _quarterly_eps(t_obj)
+                        et = None
+                        if eps_r and eps_o and abs(eps_o) > 0.001:
+                            raw_et = (eps_r - eps_o) / abs(eps_o)
+                            et     = max(-1.0, min(1.0, raw_et / 2.0))
+                        rg = revenue_growth_yoy(rev4)
+                        st.json({
+                            "Rev Q1 raw (INR)":  rev4[0],
+                            "Rev Q4 raw (INR)":  rev4[3],
+                            "Rev Q1 (Rs TCr)":   (rev4[0] / 1e11) if rev4[0] else None,
+                            "Rev YoY Growth%":   rg,
+                            "EPS recent":        eps_r,
+                            "EPS 1yr ago":       eps_o,
+                            "Earn Traj":         et,
+                        })
                         break
                 else:
-                    st.warning("No quarterly income statement found for {}".format(test_yf))
+                    st.warning("No quarterly income statement found")
             except Exception as ex:
-                st.error("Quarterly financials error: {}".format(ex))
+                st.error("Quarterly income statement error: {}".format(ex))
 
-            st.markdown("### 3. yfinance price history (momentum)")
+            st.markdown("### 4. Price history (momentum)")
             try:
-                hist = yf.download(test_yf, period="3mo", interval="1d",
+                hist = yf.download(test_yf, period="7mo", interval="1d",
                                    auto_adjust=True, progress=False)
                 if not hist.empty:
                     close_col = hist["Close"]
                     if isinstance(close_col, pd.DataFrame):
                         close_col = close_col.iloc[:, 0]
-                    latest = float(pd.to_numeric(close_col, errors="coerce").dropna().iloc[-1])
+                    closes = pd.to_numeric(close_col, errors="coerce").dropna()
+                    latest = float(closes.iloc[-1])
                     st.success("Price history OK — {} rows, latest close: {:.2f}".format(
                         len(hist), latest))
+
+                    hist_m = yf.download(test_yf, period="7mo", interval="1mo",
+                                         auto_adjust=True, progress=False)
+                    close_m = hist_m["Close"]
+                    if isinstance(close_m, pd.DataFrame):
+                        close_m = close_m.iloc[:, 0]
+                    closes_m = pd.to_numeric(close_m, errors="coerce").dropna()
+                    px_now   = float(closes_m.iloc[-1])
+
+                    def ret_mo(n):
+                        idx = -(n + 1)
+                        if abs(idx) > len(closes_m):
+                            return None
+                        px = float(closes_m.iloc[idx])
+                        return round((px_now / px - 1) * 100.0, 2) if px > 0 else None
+
+                    dr  = closes.pct_change().dropna().tail(90)
+                    vol = round(float(dr.std() * np.sqrt(252) * 100.0), 2) if len(dr) >= 15 else None
+                    r1, r3, r6 = ret_mo(1), ret_mo(3), ret_mo(6)
+                    skip = (r6 - r1) if (r6 and r1) else None
+                    mom  = round(skip / vol, 3) if (skip and vol and vol > 0) else skip
+                    st.json({
+                        "Ret 1Mo%":       r1,
+                        "Ret 3Mo%":       r3,
+                        "Ret 6Mo%":       r6,
+                        "Trailing Vol%":  vol,
+                        "Momentum Score": mom,
+                    })
                 else:
                     st.warning("Price history empty for {}".format(test_yf))
             except Exception as ex:
                 st.error("Price history error: {}".format(ex))
-
-            st.markdown("### 4. Computed metrics preview")
-            try:
-                t_obj = yf.Ticker(test_yf)
-                info  = t_obj.info or {}
-                rev4  = _quarterly_revenues(t_obj)
-                eps_r, eps_o = _quarterly_eps(t_obj)
-                et = None
-                if eps_r and eps_o and abs(eps_o) > 0.001:
-                    raw_et = (eps_r - eps_o) / abs(eps_o)
-                    et     = max(-1.0, min(1.0, raw_et / 2.0))
-                rg = revenue_growth_yoy(rev4)
-                roe  = decimal_to_pct(_extract_scalar(info, "returnOnEquity"))
-                roic = decimal_to_pct(_extract_scalar(info, "returnOnAssets"))
-                om   = decimal_to_pct(_extract_scalar(info, "operatingMargins"))
-                ebitda  = _extract_scalar(info, "ebitda")
-                int_exp = _extract_scalar(info, "interestExpense")
-                ic = None
-                if ebitda and int_exp and int_exp != 0:
-                    ic = min(abs(ebitda / int_exp), 100.0)
-                st.json({
-                    "Rev Q1 (newest)":  rev4[0],
-                    "Rev Q4 (1yr ago)": rev4[3],
-                    "Rev YoY Growth%":  rg,
-                    "EPS recent":       eps_r,
-                    "EPS 1yr ago":      eps_o,
-                    "Earn Traj":        et,
-                    "ROE%":             roe,
-                    "ROIC proxy (ROA%)": roic,
-                    "Op Margin%":       om,
-                    "Int Coverage":     ic,
-                })
-            except Exception as ex:
-                st.error("Computed metrics error: {}".format(ex))
