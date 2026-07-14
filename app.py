@@ -89,7 +89,7 @@ def sf(val):
         return None
 
 def fmt_mc_inr(val):
-    """Format market cap in Rs Lakh Cr for KPI panel."""
+    """Format market cap in ₹Lakh Cr for KPI panel."""
     if val is None or (isinstance(val, float) and pd.isna(val)) or val == 0:
         return "N/A"
     lakh_cr = val / 1e12        # 1 Lakh Cr = 10^12
@@ -697,10 +697,10 @@ def build_screener_table(universe_df, yf_fundamentals, momentum_map):
         t_vol     = to_num(mom.get("trailing_vol"))
 
         # ── Unit conversions ─────────────────────────────────────────────────
-        # Market Cap: raw bytes → Rs Lakh Cr  (1 Lakh Cr = 1e12)
+        # Market Cap: raw bytes → ₹Lakh Cr  (1 Lakh Cr = 1e12)
         mc_lakh_cr = (mc / 1e12) if mc is not None else None
 
-        # Revenue quarters: raw INR → Rs Thousand Cr  (1 Thousand Cr = 1e11)
+        # Revenue quarters: raw INR → ₹Thousand Cr  (1 Thousand Cr = 1e11)
         def to_tcr(v):
             return (float(v) / 1e11) if (v is not None and pd.notna(v)) else None
 
@@ -709,7 +709,7 @@ def build_screener_table(universe_df, yf_fundamentals, momentum_map):
             "YF Ticker":          t,
             "Sector":             sec,
             "Price (Rs)":         price,
-            "Mkt Cap (Rs LCr)":   mc_lakh_cr,
+            "Mkt Cap (₹LCr)":   mc_lakh_cr,
             "Mkt Cap Raw":        mc,
             "P/E":                pe,
             "Fwd P/E":            fwd_pe,
@@ -728,10 +728,10 @@ def build_screener_table(universe_df, yf_fundamentals, momentum_map):
             "Ret 6Mo%":           ret_6mo,
             "Trailing Vol%":      t_vol,
             "Eligible":           True,
-            "Rev Q1 (Rs TCr)":    to_tcr(rq1),
-            "Rev Q2 (Rs TCr)":    to_tcr(rq2),
-            "Rev Q3 (Rs TCr)":    to_tcr(rq3),
-            "Rev Q4 (Rs TCr)":    to_tcr(rq4),
+            "Rev Q1 (₹ 1000Cr)":    to_tcr(rq1),
+            "Rev Q2 (₹ 1000Cr)":    to_tcr(rq2),
+            "Rev Q3 (₹ 1000Cr)":    to_tcr(rq3),
+            "Rev Q4 (₹ 1000Cr)":    to_tcr(rq4),
             "Rev Growth% (YoY)":  to_num(growth),
         })
 
@@ -743,11 +743,11 @@ def build_screener_table(universe_df, yf_fundamentals, momentum_map):
     scr["MC% of Nifty50"] = scr["Mkt Cap Raw"] / total_mc * 100.0 if total_mc > 0 else None
 
     num_cols = [
-        "Price (Rs)", "Mkt Cap (Rs LCr)", "P/E", "Fwd P/E", "PEG", "52W Pos%",
+        "Price (Rs)", "Mkt Cap (₹ LCr)", "P/E", "Fwd P/E", "PEG", "52W Pos%",
         "ROIC% (ROA)", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
         "Quality Score", "Earn Traj", "Momentum Score",
         "Ret 1Mo%", "Ret 3Mo%", "Ret 6Mo%", "Trailing Vol%", "MC% of Nifty50",
-        "Rev Q1 (Rs TCr)", "Rev Q2 (Rs TCr)", "Rev Q3 (Rs TCr)", "Rev Q4 (Rs TCr)",
+        "Rev Q1 (₹ 1000Cr)", "Rev Q2 (₹ 1000Cr)", "Rev Q3 (₹ 1000Cr)", "Rev Q4 (₹ 1000Cr)",
         "Rev Growth% (YoY)",
     ]
     for c in num_cols:
@@ -792,8 +792,8 @@ def render_sector_kpi_panel(scr, sector_sel):
     )
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.markdown(_kpi("Sector Mkt Cap",   fmt_mc_inr(sec_mc),   "Rs Lakh Cr"),          unsafe_allow_html=True)
-    c2.markdown(_kpi("Nifty 50 Mkt Cap", fmt_mc_inr(total_mc), "Rs Lakh Cr"),          unsafe_allow_html=True)
+    c1.markdown(_kpi("Sector Mkt Cap",   fmt_mc_inr(sec_mc),   "₹ L Cr"),          unsafe_allow_html=True)
+    c2.markdown(_kpi("Nifty 50 Mkt Cap", fmt_mc_inr(total_mc), "₹ L Cr"),          unsafe_allow_html=True)
     c3.markdown(_kpi("Sector Share",     "{:.1f}%".format(pct), "{} stocks".format(len(sdata))), unsafe_allow_html=True)
     c4.markdown(_kpi("Median P/E",
                      "{:.1f}".format(med_pe) if pd.notna(med_pe) else "N/A",
@@ -915,7 +915,7 @@ with page_screener:
         ])
         pe_max   = fc3.number_input("Max PE",              value=9999,  step=10)
         peg_max  = fc4.number_input("Max PEG",             value=999.0, step=1.0)
-        mc_min_l = fc5.number_input("Min Mkt Cap (Rs LCr)", value=0.0,   step=1.0)
+        mc_min_l = fc5.number_input("Min Mkt Cap (₹ L Cr)", value=0.0,   step=1.0)
 
     with st.expander("Quality Filters", expanded=False):
         qc1, qc2, qc3, qc4 = st.columns(4)
@@ -934,7 +934,7 @@ with page_screener:
     filt = scr.copy()
     if sector_sel != "All Sectors":
         filt = filt[filt["Sector"] == sector_sel]
-    filt = filt[(filt["Mkt Cap (Rs LCr)"].isna())  | (filt["Mkt Cap (Rs LCr)"]  >= mc_min_l)]
+    filt = filt[(filt["Mkt Cap (₹LCr)"].isna())  | (filt["Mkt Cap (₹ L Cr)"]  >= mc_min_l)]
     filt = filt[(filt["P/E"].isna())                | (filt["P/E"]               <= pe_max)]
     filt = filt[(filt["PEG"].isna())                | (filt["PEG"]               <= peg_max)]
     filt = filt[(filt["ROE%"].isna())               | (filt["ROE%"]              >= roe_min_f)]
@@ -951,7 +951,7 @@ with page_screener:
         "MC% of Nifty50 high to low": (["MC% of Nifty50"],      [False]),
         "Price low to high":          (["Price (Rs)"],           [True]),
         "Price high to low":          (["Price (Rs)"],           [False]),
-        "Mkt Cap high to low":        (["Mkt Cap (Rs LCr)"],     [False]),
+        "Mkt Cap high to low":        (["Mkt Cap (₹LCr)"],     [False]),
         "PE low to high":             (["P/E"],                  [True]),
         "Fwd PE low to high":         (["Fwd P/E"],              [True]),
         "PEG low to high":            (["PEG"],                  [True]),
@@ -975,8 +975,8 @@ with page_screener:
         "Quality Score", "Momentum Score", "Ret 1Mo%", "Ret 3Mo%",
         "Ret 6Mo%", "Trailing Vol%", "Score", "Conviction Score",
         "Rev Growth% (YoY)", "MC% of Nifty50", "Price (Rs)",
-        "Mkt Cap (Rs LCr)",
-        "Rev Q1 (Rs TCr)", "Rev Q2 (Rs TCr)", "Rev Q3 (Rs TCr)", "Rev Q4 (Rs TCr)",
+        "Mkt Cap (₹LCr)",
+        "Rev Q1 (₹TCr)", "Rev Q2 (₹TCr)", "Rev Q3 (₹TCr)", "Rev Q4 (₹TCr)",
     ]:
         if c in disp.columns:
             disp[c] = disp[c].round(2)
@@ -992,13 +992,13 @@ with page_screener:
     # PEG Method column intentionally excluded from display
     COLS = [
         "Ticker", "Sector",
-        "Price (Rs)", "52W Pos%", "Mkt Cap (Rs LCr)", "MC% of Nifty50",
+        "Price (Rs)", "52W Pos%", "Mkt Cap (₹LCr)", "MC% of Nifty50",
         "P/E", "Fwd P/E", "PEG", "Earn Traj",
         "ROIC% (ROA)", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
         "Quality Score", "Quality Flag",
         "Momentum Score", "Ret 1Mo%", "Ret 3Mo%", "Ret 6Mo%", "Trailing Vol%",
         "Score", "Conviction Score", "Rank",
-        "Rev Q1 (Rs TCr)", "Rev Q2 (Rs TCr)", "Rev Q3 (Rs TCr)", "Rev Q4 (Rs TCr)",
+        "Rev Q1 (₹TCr)", "Rev Q2 (₹TCr)", "Rev Q3 (₹TCr)", "Rev Q4 (₹TCr)",
         "Rev Growth% (YoY)",
     ]
     disp_final = disp[[c for c in COLS if c in disp.columns]].copy()
@@ -1014,8 +1014,8 @@ with page_screener:
     st.markdown("---")
     st.markdown("**Column Glossary**")
     st.markdown(
-        "- **Mkt Cap (Rs LCr)**: Market cap in Rs Lakh Crore (1 LCr = Rs 1,00,000 Cr = 10^12).\n"
-        "- **Rev Q1-Q4 (Rs TCr)**: Quarterly revenue in Rs Thousand Crore (1 TCr = Rs 1,000 Cr = 10^11).\n"
+        "- **Mkt Cap (₹LCr)**: Market cap in ₹Lakh Crore (1 LCr = ₹1,00,000 Cr = 10^12).\n"
+        "- **Rev Q1-Q4 (₹TCr)**: Quarterly revenue in ₹Thousand Crore (1 TCr = ₹1,000 Cr = 10^11).\n"
         "- **P/E**: Trailing twelve months P/E from yfinance trailingPE.\n"
         "- **Fwd P/E**: Forward P/E from yfinance forwardPE (analyst consensus).\n"
         "- **PEG**: From yfinance pegRatio if available; else calculated from Fwd P/E / EPS growth.\n"
@@ -1043,9 +1043,9 @@ with page_about:
     st.markdown(
         "| Field | yfinance source | Unit in table |\n"
         "|---|---|---|\n"
-        "| Price | currentPrice / regularMarketPrice | Rs |\n"
-        "| Market Cap | marketCap | Rs Lakh Cr |\n"
-        "| 52W High/Low | fiftyTwoWeekHigh/Low | Rs |\n"
+        "| Price | currentPrice / regularMarketPrice | ₹|\n"
+        "| Market Cap | marketCap | ₹Lakh Cr |\n"
+        "| 52W High/Low | fiftyTwoWeekHigh/Low | ₹|\n"
         "| Trailing P/E | trailingPE | x |\n"
         "| Forward P/E | forwardPE | x |\n"
         "| PEG | pegRatio (or calculated) | x |\n"
@@ -1055,7 +1055,7 @@ with page_about:
         "| Int Coverage | EBIT/InterestExpense from income_stmt | x |\n"
         "| Debt/Equity | debtToEquity | ratio |\n"
         "| EPS (quarterly) | quarterly_income_stmt | for Earn Traj |\n"
-        "| Revenue (quarterly) | quarterly_income_stmt | Rs Thousand Cr |\n"
+        "| Revenue (quarterly) | quarterly_income_stmt | ₹Thousand Cr |\n"
         "| Momentum | yf.download() price history | score |\n"
         "| Universe | Wikipedia NIFTY_50 | cached 24h |\n"
     )
@@ -1139,7 +1139,7 @@ with page_debug:
                         st.json({
                             "Rev Q1 raw (INR)":  rev4[0],
                             "Rev Q4 raw (INR)":  rev4[3],
-                            "Rev Q1 (Rs TCr)":   (rev4[0] / 1e11) if rev4[0] else None,
+                            "Rev Q1 (₹TCr)":   (rev4[0] / 1e11) if rev4[0] else None,
                             "Rev YoY Growth%":   rg,
                             "EPS recent":        eps_r,
                             "EPS 1yr ago":       eps_o,
