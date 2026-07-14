@@ -1,4 +1,4 @@
-# app.py  (Nifty 50 Screener v6 — all fixes applied)
+# app.py  (Nifty 50 Screener v6 — FMP .NSE fix + yfinance Series fix)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -80,6 +80,18 @@ SECTOR_MAP = {
     "Realty":                            "Real Estate",
 }
 
+# ─── Ticker helpers ───────────────────────────────────────────────────────────
+# yfinance uses RELIANCE.NS  (NSE suffix)
+# FMP uses      RELIANCE.NSE (FMP's own NSE suffix)
+
+def yf_ticker(base):
+    """base = 'RELIANCE'  ->  'RELIANCE.NS'"""
+    return base + ".NS"
+
+def fmp_ticker(base):
+    """base = 'RELIANCE'  ->  'RELIANCE.NSE'"""
+    return base + ".NSE"
+
 # ─── FMP Key ──────────────────────────────────────────────────────────────────
 def get_fmp_key():
     try:
@@ -99,7 +111,7 @@ def sf(val):
         return None
 
 def fmt_mc_inr(val):
-    if pd.isna(val) or val == 0:
+    if val is None or (isinstance(val, float) and pd.isna(val)) or val == 0:
         return "N/A"
     cr = val / 1e7
     if cr >= 100000:
@@ -225,8 +237,9 @@ def get_nifty50_universe():
                         gics = gics_name
                         break
             data.append({
-                "Ticker":     raw_t + ".NS",
-                "NSE Symbol": raw_t,
+                "Base":       raw_t,                  # e.g. RELIANCE
+                "YF Ticker":  yf_ticker(raw_t),       # e.g. RELIANCE.NS
+                "FMP Ticker": fmp_ticker(raw_t),      # e.g. RELIANCE.NSE
                 "Sector":     gics or raw_s,
                 "NSE Sector": raw_s,
             })
@@ -234,23 +247,28 @@ def get_nifty50_universe():
         if len(data) < 30:
             raise RuntimeError("Only {} rows".format(len(data)))
 
-        df = pd.DataFrame(data).drop_duplicates(subset=["Ticker"])
+        df = pd.DataFrame(data).drop_duplicates(subset=["FMP Ticker"])
         st.success("Universe: {} stocks from Wikipedia".format(len(df)))
         return df
 
     except Exception as e:
         st.warning("Wikipedia failed: {}. Using fallback list.".format(e))
+        fallback_bases = [
+            ("RELIANCE",   "Energy"),
+            ("TCS",        "Information Technology"),
+            ("HDFCBANK",   "Financials"),
+            ("INFY",       "Information Technology"),
+            ("ICICIBANK",  "Financials"),
+            ("HINDUNILVR", "Consumer Staples"),
+            ("ITC",        "Consumer Staples"),
+            ("SBIN",       "Financials"),
+            ("BHARTIARTL", "Communication Services"),
+            ("LT",         "Industrials"),
+        ]
         return pd.DataFrame([
-            {"Ticker": "RELIANCE.NS",   "NSE Symbol": "RELIANCE",   "Sector": "Energy",                 "NSE Sector": "Oil Gas & Consumable Fuels"},
-            {"Ticker": "TCS.NS",        "NSE Symbol": "TCS",        "Sector": "Information Technology", "NSE Sector": "Information Technology"},
-            {"Ticker": "HDFCBANK.NS",   "NSE Symbol": "HDFCBANK",   "Sector": "Financials",             "NSE Sector": "Financial Services"},
-            {"Ticker": "INFY.NS",       "NSE Symbol": "INFY",       "Sector": "Information Technology", "NSE Sector": "Information Technology"},
-            {"Ticker": "ICICIBANK.NS",  "NSE Symbol": "ICICIBANK",  "Sector": "Financials",             "NSE Sector": "Financial Services"},
-            {"Ticker": "HINDUNILVR.NS", "NSE Symbol": "HINDUNILVR", "Sector": "Consumer Staples",       "NSE Sector": "FMCG"},
-            {"Ticker": "ITC.NS",        "NSE Symbol": "ITC",        "Sector": "Consumer Staples",       "NSE Sector": "FMCG"},
-            {"Ticker": "SBIN.NS",       "NSE Symbol": "SBIN",       "Sector": "Financials",             "NSE Sector": "Financial Services"},
-            {"Ticker": "BHARTIARTL.NS", "NSE Symbol": "BHARTIARTL", "Sector": "Communication Services", "NSE Sector": "Telecommunication"},
-            {"Ticker": "LT.NS",         "NSE Symbol": "LT",         "Sector": "Industrials",            "NSE Sector": "Construction"},
+            {"Base": b, "YF Ticker": yf_ticker(b), "FMP Ticker": fmp_ticker(b),
+             "Sector": s, "NSE Sector": s}
+            for b, s in fallback_bases
         ])
 
 # ─── FMP Quotes ───────────────────────────────────────────────────────────────
@@ -269,10 +287,12 @@ def _fill_quote(out, sym, item):
     }
 
 @st.cache_data(ttl=3600)
-def fetch_fmp_quotes(tickers, api_key):
-    out = {t: {} for t in tickers}
-    tl  = list(tickers)
+def fetch_fmp_quotes(fmp_tickers, api_key):
+    """fmp_tickers: tuple of FMP-format tickers e.g. ('RELIANCE.NSE', ...)"""
+    out = {t: {} for t in fmp_tickers}
+    tl  = list(fmp_tickers)
 
+    # Bulk call
     syms_str = ",".join(tl)
     data = fmp_get("quote/{}".format(syms_str), api_key)
     if data and isinstance(data, list) and len(data) > 0:
@@ -284,6 +304,7 @@ def fetch_fmp_quotes(tickers, api_key):
         if filled >= len(tl) * 0.5:
             return out
 
+    # Individual fallback for missing
     missing = [t for t in tl if out[t].get("price") is None]
     if missing:
         def one_quote(t):
@@ -300,9 +321,9 @@ def fetch_fmp_quotes(tickers, api_key):
 
 # ─── FMP Ratios TTM ───────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
-def fetch_fmp_ratios(tickers, api_key):
+def fetch_fmp_ratios(fmp_tickers, api_key):
     out = {}
-    tl  = list(tickers)
+    tl  = list(fmp_tickers)
 
     def one(t):
         data = fmp_get("ratios-ttm/{}".format(t), api_key)
@@ -326,11 +347,8 @@ def fetch_fmp_ratios(tickers, api_key):
             ic = min(float(ic_raw), 100.0)
 
         peg = float(peg_raw) if (peg_raw is not None and 0 < peg_raw <= 500) else None
-
         pe_ttm_ratios = (
-            float(pe_ttm_r)
-            if (pe_ttm_r is not None and 0 < pe_ttm_r <= 10000)
-            else None
+            float(pe_ttm_r) if (pe_ttm_r is not None and 0 < pe_ttm_r <= 10000) else None
         )
 
         return t, {
@@ -362,9 +380,9 @@ def fetch_fmp_ratios(tickers, api_key):
 
 # ─── FMP Income Statement ─────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
-def fetch_fmp_income(tickers, api_key):
+def fetch_fmp_income(fmp_tickers, api_key):
     out = {}
-    tl  = list(tickers)
+    tl  = list(fmp_tickers)
 
     def one(t):
         data = fmp_get(
@@ -411,26 +429,57 @@ def fetch_fmp_income(tickers, api_key):
     stat.empty()
     return out
 
-# ─── Momentum ─────────────────────────────────────────────────────────────────
+# ─── Momentum (yfinance — uses .NS tickers) ───────────────────────────────────
 @st.cache_data(ttl=3600)
-def fetch_momentum_batch(tickers):
-    tl  = list(tickers)
+def fetch_momentum_batch(yf_tickers):
+    """yf_tickers: tuple of YF-format tickers e.g. ('RELIANCE.NS', ...)"""
+    tl  = list(yf_tickers)
     out = {t: {} for t in tl}
 
-    def _get_close(df, ticker):
-        if df is None or df.empty:
+    def _safe_series(obj, ticker):
+        """
+        Extract a clean float Series from whatever yfinance returns.
+        Handles: plain Series, single-col DataFrame, MultiIndex DataFrame.
+        Fixes: 'float() argument must be a string or a real number, not Series'
+        """
+        if obj is None:
             return pd.Series(dtype=float)
-        if isinstance(df.columns, pd.Index) and "Close" in df.columns:
-            return df["Close"].dropna()
-        if isinstance(df.columns, pd.MultiIndex):
+
+        # Already a Series
+        if isinstance(obj, pd.Series):
+            return pd.to_numeric(obj, errors="coerce").dropna()
+
+        if not isinstance(obj, pd.DataFrame) or obj.empty:
+            return pd.Series(dtype=float)
+
+        # MultiIndex columns: ("Close", "RELIANCE.NS")
+        if isinstance(obj.columns, pd.MultiIndex):
             try:
-                return df["Close"][ticker].dropna()
+                col = obj["Close"][ticker]
+                if isinstance(col, pd.DataFrame):
+                    col = col.iloc[:, 0]
+                return pd.to_numeric(col, errors="coerce").dropna()
             except (KeyError, TypeError):
                 pass
-        try:
-            return df[ticker]["Close"].dropna()
-        except (KeyError, TypeError):
-            pass
+            # fallback: flatten first Close column found
+            try:
+                close_cols = [(l0, l1) for l0, l1 in obj.columns if str(l0) == "Close"]
+                if close_cols:
+                    col = obj[close_cols[0]]
+                    if isinstance(col, pd.DataFrame):
+                        col = col.iloc[:, 0]
+                    return pd.to_numeric(col, errors="coerce").dropna()
+            except Exception:
+                pass
+            return pd.Series(dtype=float)
+
+        # Flat columns
+        if "Close" in obj.columns:
+            col = obj["Close"]
+            if isinstance(col, pd.DataFrame):
+                col = col.iloc[:, 0]
+            return pd.to_numeric(col, errors="coerce").dropna()
+
         return pd.Series(dtype=float)
 
     def _process_batch(batch):
@@ -453,17 +502,31 @@ def fetch_momentum_batch(tickers):
         result = {}
         for t in batch:
             try:
-                closes_m = _get_close(raw_m, t)
-                closes_d = _get_close(raw_d, t)
+                # For single-ticker downloads, raw_d/raw_m are flat DataFrames
+                if len(batch) == 1:
+                    closes_d = _safe_series(raw_d, t)
+                    closes_m = _safe_series(raw_m, t)
+                else:
+                    # Multi-ticker: slice per ticker then extract Close
+                    try:
+                        td = raw_d[t] if t in raw_d.columns.get_level_values(1) else raw_d
+                        tm = raw_m[t] if t in raw_m.columns.get_level_values(1) else raw_m
+                    except Exception:
+                        td, tm = raw_d, raw_m
+                    closes_d = _safe_series(td, t)
+                    closes_m = _safe_series(tm, t)
+
                 if len(closes_m) < 2:
                     continue
+
                 px_now = float(closes_m.iloc[-1])
 
                 def ret_mo(n):
                     idx = -(n + 1)
                     if abs(idx) > len(closes_m):
                         return None
-                    px = float(closes_m.iloc[idx])
+                    val = closes_m.iloc[idx]
+                    px  = float(val) if not isinstance(val, pd.Series) else float(val.iloc[0])
                     return (px_now / px - 1) * 100.0 if px > 0 else None
 
                 r1 = ret_mo(1)
@@ -603,11 +666,14 @@ def compute_conviction_scores(scr):
 def build_screener_table(universe_df, fmp_quotes, fmp_ratios, fmp_income, momentum_map):
     rows = []
     for _, r in universe_df.iterrows():
-        t   = r["Ticker"]
-        sec = r["Sector"]
-        fq  = fmp_quotes.get(t, {})
-        fr  = fmp_ratios.get(t, {})
-        fi  = fmp_income.get(t, {})
+        fmp_t = r["FMP Ticker"]   # for FMP lookups
+        yf_t  = r["YF Ticker"]    # for momentum lookups
+        base  = r["Base"]         # display symbol
+        sec   = r["Sector"]
+
+        fq  = fmp_quotes.get(fmp_t, {})
+        fr  = fmp_ratios.get(fmp_t, {})
+        fi  = fmp_income.get(fmp_t, {})
 
         price         = to_num(fq.get("price"))
         mc            = to_num(fq.get("mc"))
@@ -656,7 +722,7 @@ def build_screener_table(universe_df, fmp_quotes, fmp_ratios, fmp_income, moment
             float(om)   if pd.notna(om)   else None,
         )
 
-        mom       = momentum_map.get(t, {})
+        mom       = momentum_map.get(yf_t, {})
         ret_1mo   = to_num(mom.get("ret_1mo"))
         ret_3mo   = to_num(mom.get("ret_3mo"))
         ret_6mo   = to_num(mom.get("ret_6mo"))
@@ -664,8 +730,9 @@ def build_screener_table(universe_df, fmp_quotes, fmp_ratios, fmp_income, moment
         t_vol     = to_num(mom.get("trailing_vol"))
 
         rows.append({
-            "Ticker":            t.replace(".NS", ""),
-            "NSE Symbol":        t,
+            "Ticker":            base,
+            "FMP Ticker":        fmp_t,
+            "YF Ticker":         yf_t,
             "Sector":            sec,
             "Price (Rs)":        price,
             "Mkt Cap (RsCr)":    (mc / 1e7) if mc is not None else None,
@@ -802,7 +869,7 @@ st.markdown(
 )
 
 st.markdown("## Nifty 50 Fundamental Screener")
-st.caption("FMP API · Wikipedia universe · 5-factor scoring · INR")
+st.caption("FMP API (.NSE tickers) + yfinance (.NS tickers) · Wikipedia universe · 5-factor scoring · INR")
 
 page_screener, page_about, page_debug = st.tabs(["Screener", "About", "Debug"])
 
@@ -836,27 +903,29 @@ with page_screener:
 
     with st.spinner("Loading universe from Wikipedia..."):
         universe_df = get_nifty50_universe()
-    tickers = tuple(universe_df["Ticker"].tolist())
 
-    with st.spinner("Fetching FMP quotes..."):
-        fmp_quotes = fetch_fmp_quotes(tickers, fmp_key)
+    fmp_tickers = tuple(universe_df["FMP Ticker"].tolist())   # .NSE for FMP
+    yf_tickers  = tuple(universe_df["YF Ticker"].tolist())    # .NS  for yfinance
 
-    with st.spinner("Fetching FMP ratios..."):
-        fmp_ratios = fetch_fmp_ratios(tickers, fmp_key)
+    with st.spinner("Fetching FMP quotes (price, PE, MC, 52W)..."):
+        fmp_quotes = fetch_fmp_quotes(fmp_tickers, fmp_key)
 
-    with st.spinner("Fetching FMP income statements..."):
-        fmp_income = fetch_fmp_income(tickers, fmp_key)
+    with st.spinner("Fetching FMP ratios (ROE, margins, ROIC, PEG)..."):
+        fmp_ratios = fetch_fmp_ratios(fmp_tickers, fmp_key)
+
+    with st.spinner("Fetching FMP income statements (EPS, revenue)..."):
+        fmp_income = fetch_fmp_income(fmp_tickers, fmp_key)
 
     with st.spinner("Fetching momentum data (yfinance)..."):
-        momentum = fetch_momentum_batch(tickers)
+        momentum = fetch_momentum_batch(yf_tickers)
 
-    total_t   = len(tickers)
-    has_price = sum(1 for t in tickers if fmp_quotes.get(t, {}).get("price") is not None)
-    has_pe    = sum(1 for t in tickers if fmp_quotes.get(t, {}).get("pe")    is not None)
-    has_roe   = sum(1 for t in tickers if fmp_ratios.get(t, {}).get("roe")   is not None)
-    has_roic  = sum(1 for t in tickers if fmp_ratios.get(t, {}).get("roic")  is not None)
-    has_et    = sum(1 for t in tickers if fmp_income.get(t, {}).get("earn_traj") is not None)
-    has_mom   = sum(1 for t in tickers if momentum.get(t,  {}).get("momentum_score") is not None)
+    total_t   = len(fmp_tickers)
+    has_price = sum(1 for t in fmp_tickers if fmp_quotes.get(t, {}).get("price") is not None)
+    has_pe    = sum(1 for t in fmp_tickers if fmp_quotes.get(t, {}).get("pe")    is not None)
+    has_roe   = sum(1 for t in fmp_tickers if fmp_ratios.get(t, {}).get("roe")   is not None)
+    has_roic  = sum(1 for t in fmp_tickers if fmp_ratios.get(t, {}).get("roic")  is not None)
+    has_et    = sum(1 for t in fmp_tickers if fmp_income.get(t, {}).get("earn_traj") is not None)
+    has_mom   = sum(1 for t in yf_tickers  if momentum.get(t,  {}).get("momentum_score") is not None)
 
     coverage_color = "info" if has_price >= total_t * 0.7 else "warning"
     getattr(st, coverage_color)(
@@ -864,7 +933,7 @@ with page_screener:
         "Price: {}/{} ({:.0f}%) · P/E: {}/{} ({:.0f}%) · "
         "ROE: {}/{} ({:.0f}%) · ROIC: {}/{} ({:.0f}%) · "
         "Earn Traj: {}/{} ({:.0f}%) · Momentum: {}/{} ({:.0f}%) · "
-        "Source: FMP + yfinance".format(
+        "FMP tickers use .NSE · yfinance uses .NS".format(
             has_price, total_t, has_price / total_t * 100,
             has_pe,    total_t, has_pe    / total_t * 100,
             has_roe,   total_t, has_roe   / total_t * 100,
@@ -1007,6 +1076,7 @@ with page_screener:
         "- **Score**: Sector-relative percentile. Valuation 25% + Quality 25% + PEG 20% + Earn Traj 15% + Momentum 15%.\n"
         "- **Conviction Score**: Score adjusted for data completeness and sector discount, 0-100.\n"
         "- **Rank**: Within-sector rank by Score (1 = best in sector).\n"
+        "- **Ticker source**: FMP uses TICKER.NSE format · yfinance uses TICKER.NS format.\n"
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1014,6 +1084,15 @@ with page_screener:
 # ══════════════════════════════════════════════════════════════════════════════
 with page_about:
     st.markdown("## About - Nifty 50 Screener v6")
+
+    st.markdown("### Ticker Format by Data Source")
+    st.markdown(
+        "| Source | Format | Example |\n"
+        "|---|---|---|\n"
+        "| FMP (quotes, ratios, income) | TICKER.NSE | RELIANCE.NSE |\n"
+        "| yfinance (momentum / price history) | TICKER.NS | RELIANCE.NS |\n"
+        "| Display | Base symbol only | RELIANCE |\n"
+    )
 
     st.markdown("### Data Architecture")
     st.markdown(
@@ -1035,12 +1114,6 @@ with page_about:
         "| Quarterly income / balance sheet | Analyst EPS consensus |\n"
     )
 
-    st.info(
-        "Fwd P/E has been removed in v6. The field previously labelled Fwd P/E "
-        "was a second TTM P/E source, which was misleading. "
-        "True forward P/E requires the FMP paid tier /analyst-estimates endpoint."
-    )
-
     st.markdown("### Scoring Model")
     st.code(
         "Score = 25% Valuation (P/E percentile, lower = better)\n"
@@ -1050,28 +1123,25 @@ with page_about:
         "      + 15% Momentum  (6M-1M skip return / trailing volatility)",
         language=None,
     )
-
     st.markdown(
         "Scores are sector-relative percentile ranks. "
-        "Missing data applies a penalty: -15% for 2 missing factors, -30% for 3 or more. "
-        "Quality Score returns None (not 0) when all quality inputs are absent, "
-        "ensuring the penalty is correctly triggered."
+        "Missing data applies a penalty: -15% for 2 missing factors, -30% for 3 or more."
     )
 
-    st.markdown("### Key Fixes in v6 vs v5")
+    st.markdown("### Key Fixes")
     st.markdown(
         "| # | Issue | Fix |\n"
         "|---|---|---|\n"
-        "| 1 | st.stop() outside if block | Moved inside if not fmp_key block |\n"
-        "| 2 | Revenue growth used inverted CAGR formula | Replaced with YoY: newest Q / same Q prior year |\n"
-        "| 3 | Fwd P/E was mislabelled TTM P/E | Removed column; noted paid-tier requirement |\n"
-        "| 4 | decimal_to_pct applied to interest coverage | Int coverage passed raw (already a multiple) |\n"
-        "| 5 | compute_quality_score returned 0 for all-None inputs | Now returns None to trigger missing penalty |\n"
-        "| 6 | Quality Flag not in COLS list | Added to display columns |\n"
-        "| 7 | earn_traj clipping lost nuance | Divide raw by 2.0 before clamping to [-1, +1] |\n"
-        "| 8 | pos52 could exceed 100% | Clamped to [0%, 105%] |\n"
-        "| 9 | yfinance bulk download unreliable | Batched into groups of 15 tickers |\n"
-        "| 10 | Workers too low, sleep too long | Workers raised to 10, sleep reduced to 0.3s |\n"
+        "| 1 | FMP returned empty for all endpoints | Switched from .NS to .NSE ticker format for FMP |\n"
+        "| 2 | yfinance float() Series error | _safe_series() normalises all yfinance return shapes |\n"
+        "| 3 | st.stop() outside if block | Moved inside if not fmp_key block |\n"
+        "| 4 | Revenue growth inverted CAGR | Replaced with YoY: newest Q / same Q prior year |\n"
+        "| 5 | Fwd P/E was mislabelled TTM P/E | Removed; noted paid-tier requirement |\n"
+        "| 6 | decimal_to_pct on int coverage | Int coverage passed raw (already a multiple) |\n"
+        "| 7 | quality_score returned 0 for all-None | Now returns None to trigger missing penalty |\n"
+        "| 8 | Quality Flag missing from display | Added to COLS list |\n"
+        "| 9 | earn_traj clipping lost nuance | Divide raw by 2.0 before clamping |\n"
+        "| 10 | pos52 could exceed 100% | Clamped to 0-105% |\n"
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1080,16 +1150,26 @@ with page_about:
 with page_debug:
     st.markdown("## Debug - API Diagnostics")
     fmp_key_dbg = get_fmp_key()
-    test_sym    = st.text_input("Ticker (with .NS)", value="RELIANCE.NS")
+
+    st.info(
+        "FMP ticker format for Indian NSE stocks: **RELIANCE.NSE** (not RELIANCE.NS). "
+        "yfinance uses RELIANCE.NS. Both are handled automatically in the screener."
+    )
+
+    col_a, col_b = st.columns(2)
+    test_base = col_a.text_input("Base symbol (no suffix)", value="RELIANCE")
+    test_fmp  = fmp_ticker(test_base.upper().strip())
+    test_yf   = yf_ticker(test_base.upper().strip())
+    col_b.markdown("**FMP ticker:** `{}`  |  **yfinance ticker:** `{}`".format(test_fmp, test_yf))
 
     if st.button("Run diagnostic"):
         if not fmp_key_dbg:
             st.error("No FMP key found in Streamlit Secrets.")
         else:
-            with st.spinner("Testing {}...".format(test_sym)):
+            with st.spinner("Testing {}...".format(test_base)):
 
-                st.markdown("### 1. FMP /quote")
-                d = fmp_get("quote/{}".format(test_sym), fmp_key_dbg)
+                st.markdown("### 1. FMP /quote ({})".format(test_fmp))
+                d = fmp_get("quote/{}".format(test_fmp), fmp_key_dbg)
                 if d and isinstance(d, list) and len(d) > 0:
                     item = d[0]
                     st.success("/quote OK")
@@ -1097,13 +1177,10 @@ with page_debug:
                              ["symbol", "price", "pe", "marketCap",
                               "yearHigh", "yearLow", "name", "currency"]})
                 else:
-                    st.error(
-                        "/quote empty - verify API key and that ticker "
-                        "format is RELIANCE.NS not RELIANCE"
-                    )
+                    st.error("/quote empty for {} - check API key or try another ticker".format(test_fmp))
 
-                st.markdown("### 2. FMP /ratios-ttm")
-                d = fmp_get("ratios-ttm/{}".format(test_sym), fmp_key_dbg)
+                st.markdown("### 2. FMP /ratios-ttm ({})".format(test_fmp))
+                d = fmp_get("ratios-ttm/{}".format(test_fmp), fmp_key_dbg)
                 if d and isinstance(d, list) and len(d) > 0:
                     item = d[0]
                     st.success("/ratios-ttm OK")
@@ -1113,7 +1190,7 @@ with page_debug:
                         "priceEarningsGrowthRatioTTM", "priceToEarningsRatioTTM",
                         "debtEquityRatioTTM",
                     ]})
-                    st.markdown("**Converted values (as used in screener):**")
+                    st.markdown("**Converted values:**")
                     st.json({
                         "ROIC%":                             decimal_to_pct(item.get("returnOnInvestedCapitalTTM")),
                         "ROE%":                              decimal_to_pct(item.get("returnOnEquityTTM")),
@@ -1123,11 +1200,11 @@ with page_debug:
                         "TTM P/E (ratios fallback)":         item.get("priceToEarningsRatioTTM"),
                     })
                 else:
-                    st.warning("/ratios-ttm empty - may require FMP paid tier")
+                    st.warning("/ratios-ttm empty for {} - may require FMP paid tier".format(test_fmp))
 
-                st.markdown("### 3. FMP /income-statement (quarterly)")
+                st.markdown("### 3. FMP /income-statement ({})".format(test_fmp))
                 d = fmp_get(
-                    "income-statement/{}".format(test_sym), fmp_key_dbg,
+                    "income-statement/{}".format(test_fmp), fmp_key_dbg,
                     params={"period": "quarter", "limit": "5"},
                 )
                 if d and isinstance(d, list) and len(d) > 0:
@@ -1154,20 +1231,23 @@ with page_debug:
                             "Rev YoY Growth%":     rg,
                         })
                 else:
-                    st.error("/income-statement empty")
+                    st.error("/income-statement empty for {}".format(test_fmp))
 
-                st.markdown("### 4. yfinance momentum test")
+                st.markdown("### 4. yfinance momentum test ({})".format(test_yf))
                 try:
                     test_df = yf.download(
-                        test_sym, period="3mo", interval="1d",
+                        test_yf, period="3mo", interval="1d",
                         auto_adjust=True, progress=False,
                     )
                     if not test_df.empty:
-                        latest = float(test_df["Close"].dropna().iloc[-1])
+                        close_col = test_df["Close"]
+                        if isinstance(close_col, pd.DataFrame):
+                            close_col = close_col.iloc[:, 0]
+                        latest = float(pd.to_numeric(close_col, errors="coerce").dropna().iloc[-1])
                         st.success("yfinance OK - {} rows, latest close: {:.2f}".format(
                             len(test_df), latest))
                     else:
-                        st.warning("yfinance returned empty DataFrame")
+                        st.warning("yfinance returned empty DataFrame for {}".format(test_yf))
                 except Exception as ex:
                     st.error("yfinance error: {}".format(ex))
 
