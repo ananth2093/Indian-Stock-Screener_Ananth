@@ -1,4 +1,4 @@
-# app.py  (Nifty 50 Screener v7 — display + data fixes)
+# app.py  (Nifty 50 Screener v7 — column name consistency fix)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -78,6 +78,13 @@ SECTOR_MAP = {
     "Realty":                            "Real Estate",
 }
 
+# ── Canonical column names ── defined once, used everywhere ──────────────────
+COL_MC    = "Mkt Cap (LCr)"          # Rs Lakh Crore
+COL_RQ1   = "Rev Q1 (1000Cr)"        # Rs Thousand Crore
+COL_RQ2   = "Rev Q2 (1000Cr)"
+COL_RQ3   = "Rev Q3 (1000Cr)"
+COL_RQ4   = "Rev Q4 (1000Cr)"
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def to_num(x):
     return pd.to_numeric(x, errors="coerce")
@@ -89,11 +96,10 @@ def sf(val):
         return None
 
 def fmt_mc_inr(val):
-    """Format market cap in ₹Lakh Cr for KPI panel."""
+    """Format raw market cap (INR) as Rs Lakh Cr for the KPI panel."""
     if val is None or (isinstance(val, float) and pd.isna(val)) or val == 0:
         return "N/A"
-    lakh_cr = val / 1e12        # 1 Lakh Cr = 10^12
-    return "Rs.{:.2f}L Cr".format(lakh_cr)
+    return "Rs.{:.2f}L Cr".format(val / 1e12)
 
 def percentile_score(series, ascending=True):
     result = pd.Series(index=series.index, dtype=float)
@@ -265,10 +271,6 @@ def get_nifty50_universe():
 
 # ─── Quarterly financial helpers ──────────────────────────────────────────────
 def _quarterly_revenues(ticker_obj):
-    """
-    Return last 4 quarterly revenues newest-first (raw INR values).
-    Tries quarterly_income_stmt then quarterly_financials.
-    """
     for attr in ("quarterly_income_stmt", "quarterly_financials"):
         try:
             df = getattr(ticker_obj, attr)
@@ -288,7 +290,6 @@ def _quarterly_revenues(ticker_obj):
     return [None, None, None, None]
 
 def _quarterly_eps(ticker_obj):
-    """Return (eps_recent, eps_1yr_ago) from quarterly income statement."""
     for attr in ("quarterly_income_stmt", "quarterly_financials"):
         try:
             df = getattr(ticker_obj, attr)
@@ -307,11 +308,6 @@ def _quarterly_eps(ticker_obj):
     return None, None
 
 def _interest_coverage_from_financials(ticker_obj):
-    """
-    Derive interest coverage from annual income statement:
-    EBIT / InterestExpense.
-    More reliable than using the info dict fields.
-    """
     for attr in ("income_stmt", "financials"):
         try:
             df = getattr(ticker_obj, attr)
@@ -332,7 +328,7 @@ def _interest_coverage_from_financials(ticker_obj):
                     break
             if ebit_row is not None and int_row is not None:
                 cols = sorted(ebit_row.index, reverse=True)
-                for col in cols[:2]:           # use most recent annual period
+                for col in cols[:2]:
                     ebit = safe_float(ebit_row[col])
                     iexp = safe_float(int_row[col])
                     if ebit is not None and iexp is not None and iexp != 0:
@@ -346,11 +342,6 @@ def _interest_coverage_from_financials(ticker_obj):
 # ─── yfinance fundamentals ────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def fetch_yf_fundamentals(tickers):
-    """
-    Fetch all fundamental data from yfinance.
-    Interest coverage is derived from income statement (EBIT / InterestExpense)
-    which is far more reliable than the info dict fields.
-    """
     out = {t: {} for t in tickers}
 
     def one(t):
@@ -375,16 +366,13 @@ def fetch_yf_fundamentals(tickers):
             roic = decimal_to_pct(roic_raw)
             om   = decimal_to_pct(om_raw)
 
-            # ── Interest coverage: income statement is primary source ────────
             ic = _interest_coverage_from_financials(ticker_obj)
-            # Fallback: info dict ebitda / interestExpense
             if ic is None:
                 ebitda  = _extract_scalar(info, "ebitda")
                 int_exp = _extract_scalar(info, "interestExpense")
                 if ebitda is not None and int_exp is not None and int_exp != 0:
                     ic = min(abs(ebitda / int_exp), 100.0)
 
-            # ── EPS trajectory ───────────────────────────────────────────────
             eps_r, eps_o = _quarterly_eps(ticker_obj)
             earn_traj    = None
             eps_growth   = None
@@ -400,10 +388,8 @@ def fetch_yf_fundamentals(tickers):
                     earn_traj  = max(-1.0, min(1.0, raw / 2.0))
                     eps_growth = raw * 100.0
 
-            # ── Quarterly revenue ────────────────────────────────────────────
             rev4 = _quarterly_revenues(ticker_obj)
 
-            # ── PEG ─────────────────────────────────────────────────────────
             peg        = None
             peg_method = "N/A"
             if peg_yf is not None and 0 < peg_yf <= 500:
@@ -420,22 +406,22 @@ def fetch_yf_fundamentals(tickers):
                 peg = None
 
             return t, {
-                "price":      price,
-                "mc":         mc,
-                "hi52":       hi52,
-                "lo52":       lo52,
-                "pe":         pe    if (pe    is not None and 0 < pe    <= 10000) else None,
-                "fwd_pe":     fwd_pe if (fwd_pe is not None and 0 < fwd_pe <= 10000) else None,
-                "peg":        peg,
-                "peg_method": peg_method,
-                "roe":        roe,
-                "roic":       roic,
-                "op_margin":  om,
+                "price":        price,
+                "mc":           mc,
+                "hi52":         hi52,
+                "lo52":         lo52,
+                "pe":           pe     if (pe     is not None and 0 < pe     <= 10000) else None,
+                "fwd_pe":       fwd_pe if (fwd_pe is not None and 0 < fwd_pe <= 10000) else None,
+                "peg":          peg,
+                "peg_method":   peg_method,
+                "roe":          roe,
+                "roic":         roic,
+                "op_margin":    om,
                 "int_coverage": ic,
-                "debt_eq":    de_raw,
-                "earn_traj":  earn_traj,
-                "eps_growth": eps_growth,
-                "rev4":       rev4,
+                "debt_eq":      de_raw,
+                "earn_traj":    earn_traj,
+                "eps_growth":   eps_growth,
+                "rev4":         rev4,
             }
         except Exception:
             return t, {}
@@ -462,11 +448,6 @@ def fetch_yf_fundamentals(tickers):
 # ─── Momentum ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def fetch_momentum_batch(tickers):
-    """
-    Fetch 7-month price history for momentum calculation.
-    Downloads individually (single-ticker mode) to avoid MultiIndex
-    issues with .NS tickers in bulk downloads.
-    """
     tl  = list(tickers)
     out = {t: {} for t in tl}
 
@@ -530,7 +511,6 @@ def fetch_momentum_batch(tickers):
         except Exception:
             return t, {}
 
-    # Process in chunks with threading — individual downloads per ticker
     CHUNK  = 10
     SLEEP  = 0.5
     chunks = [tl[i:i + CHUNK] for i in range(0, len(tl), CHUNK)]
@@ -697,42 +677,43 @@ def build_screener_table(universe_df, yf_fundamentals, momentum_map):
         t_vol     = to_num(mom.get("trailing_vol"))
 
         # ── Unit conversions ─────────────────────────────────────────────────
-        # Market Cap: raw bytes → ₹Lakh Cr  (1 Lakh Cr = 1e12)
-        mc_lakh_cr = (mc / 1e12) if mc is not None else None
+        # 1 Lakh Cr = 10^12  →  LCr = raw / 1e12
+        # 1 Thousand Cr = 10^11  →  1000Cr = raw / 1e11
+        def to_lcr(v):
+            return float(v) / 1e12 if (v is not None and pd.notna(v)) else None
 
-        # Revenue quarters: raw INR → ₹Thousand Cr  (1 Thousand Cr = 1e11)
         def to_tcr(v):
-            return (float(v) / 1e11) if (v is not None and pd.notna(v)) else None
+            return float(v) / 1e11 if (v is not None and pd.notna(v)) else None
 
         rows.append({
-            "Ticker":             base,
-            "YF Ticker":          t,
-            "Sector":             sec,
-            "Price (Rs)":         price,
-            "Mkt Cap (₹LCr)":   mc_lakh_cr,
-            "Mkt Cap Raw":        mc,
-            "P/E":                pe,
-            "Fwd P/E":            fwd_pe,
-            "PEG":                peg,
-            "Earn Traj":          earn_traj,
-            "52W Pos%":           to_num(pos52),
-            "ROIC% (ROA)":        roic,
-            "ROE%":               roe,
-            "Int Coverage":       ic,
-            "Op Margin%":         om,
-            "Debt/Eq":            de,
-            "Quality Score":      to_num(q_score) if q_score is not None else None,
-            "Momentum Score":     mom_score,
-            "Ret 1Mo%":           ret_1mo,
-            "Ret 3Mo%":           ret_3mo,
-            "Ret 6Mo%":           ret_6mo,
-            "Trailing Vol%":      t_vol,
-            "Eligible":           True,
-            "Rev Q1 (₹ 1000Cr)":    to_tcr(rq1),
-            "Rev Q2 (₹ 1000Cr)":    to_tcr(rq2),
-            "Rev Q3 (₹ 1000Cr)":    to_tcr(rq3),
-            "Rev Q4 (₹ 1000Cr)":    to_tcr(rq4),
-            "Rev Growth% (YoY)":  to_num(growth),
+            "Ticker":              base,
+            "YF Ticker":           t,
+            "Sector":              sec,
+            "Price (Rs)":          price,
+            COL_MC:                to_lcr(mc),      # "Mkt Cap (LCr)"
+            "Mkt Cap Raw":         mc,
+            "P/E":                 pe,
+            "Fwd P/E":             fwd_pe,
+            "PEG":                 peg,
+            "Earn Traj":           earn_traj,
+            "52W Pos%":            to_num(pos52),
+            "ROIC% (ROA)":         roic,
+            "ROE%":                roe,
+            "Int Coverage":        ic,
+            "Op Margin%":          om,
+            "Debt/Eq":             de,
+            "Quality Score":       to_num(q_score) if q_score is not None else None,
+            "Momentum Score":      mom_score,
+            "Ret 1Mo%":            ret_1mo,
+            "Ret 3Mo%":            ret_3mo,
+            "Ret 6Mo%":            ret_6mo,
+            "Trailing Vol%":       t_vol,
+            "Eligible":            True,
+            COL_RQ1:               to_tcr(rq1),     # "Rev Q1 (1000Cr)"
+            COL_RQ2:               to_tcr(rq2),
+            COL_RQ3:               to_tcr(rq3),
+            COL_RQ4:               to_tcr(rq4),
+            "Rev Growth% (YoY)":   to_num(growth),
         })
 
     scr = pd.DataFrame(rows)
@@ -742,12 +723,13 @@ def build_screener_table(universe_df, yf_fundamentals, momentum_map):
     total_mc = scr["Mkt Cap Raw"].sum()
     scr["MC% of Nifty50"] = scr["Mkt Cap Raw"] / total_mc * 100.0 if total_mc > 0 else None
 
+    # All numeric columns — names exactly match what was stored above
     num_cols = [
-        "Price (Rs)", "Mkt Cap (₹ LCr)", "P/E", "Fwd P/E", "PEG", "52W Pos%",
+        "Price (Rs)", COL_MC, "P/E", "Fwd P/E", "PEG", "52W Pos%",
         "ROIC% (ROA)", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
         "Quality Score", "Earn Traj", "Momentum Score",
         "Ret 1Mo%", "Ret 3Mo%", "Ret 6Mo%", "Trailing Vol%", "MC% of Nifty50",
-        "Rev Q1 (₹ 1000Cr)", "Rev Q2 (₹ 1000Cr)", "Rev Q3 (₹ 1000Cr)", "Rev Q4 (₹ 1000Cr)",
+        COL_RQ1, COL_RQ2, COL_RQ3, COL_RQ4,
         "Rev Growth% (YoY)",
     ]
     for c in num_cols:
@@ -792,8 +774,8 @@ def render_sector_kpi_panel(scr, sector_sel):
     )
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.markdown(_kpi("Sector Mkt Cap",   fmt_mc_inr(sec_mc),   "₹ L Cr"),          unsafe_allow_html=True)
-    c2.markdown(_kpi("Nifty 50 Mkt Cap", fmt_mc_inr(total_mc), "₹ L Cr"),          unsafe_allow_html=True)
+    c1.markdown(_kpi("Sector Mkt Cap",   fmt_mc_inr(sec_mc),   "Rs Lakh Cr"),          unsafe_allow_html=True)
+    c2.markdown(_kpi("Nifty 50 Mkt Cap", fmt_mc_inr(total_mc), "Rs Lakh Cr"),          unsafe_allow_html=True)
     c3.markdown(_kpi("Sector Share",     "{:.1f}%".format(pct), "{} stocks".format(len(sdata))), unsafe_allow_html=True)
     c4.markdown(_kpi("Median P/E",
                      "{:.1f}".format(med_pe) if pd.notna(med_pe) else "N/A",
@@ -864,10 +846,10 @@ with page_screener:
         universe_df = get_nifty50_universe()
     tickers = tuple(universe_df["Ticker"].tolist())
 
-    with st.spinner("Fetching fundamentals from yfinance (price, PE, margins, EPS, revenue, interest coverage)..."):
+    with st.spinner("Fetching fundamentals from yfinance..."):
         yf_fundamentals = fetch_yf_fundamentals(tickers)
 
-    with st.spinner("Fetching momentum data from yfinance (individual price history downloads)..."):
+    with st.spinner("Fetching momentum data from yfinance..."):
         momentum = fetch_momentum_batch(tickers)
 
     total_t   = len(tickers)
@@ -880,7 +862,7 @@ with page_screener:
 
     coverage_color = "info" if has_price >= total_t * 0.7 else "warning"
     getattr(st, coverage_color)(
-        "Data coverage (yfinance only) — "
+        "Data coverage — "
         "Price: {}/{} ({:.0f}%) · P/E: {}/{} ({:.0f}%) · "
         "ROE: {}/{} ({:.0f}%) · Int Coverage: {}/{} ({:.0f}%) · "
         "Earn Traj: {}/{} ({:.0f}%) · Momentum: {}/{} ({:.0f}%)".format(
@@ -915,7 +897,7 @@ with page_screener:
         ])
         pe_max   = fc3.number_input("Max PE",              value=9999,  step=10)
         peg_max  = fc4.number_input("Max PEG",             value=999.0, step=1.0)
-        mc_min_l = fc5.number_input("Min Mkt Cap (₹ L Cr)", value=0.0,   step=1.0)
+        mc_min_l = fc5.number_input("Min Mkt Cap (LCr)",   value=0.0,   step=1.0)
 
     with st.expander("Quality Filters", expanded=False):
         qc1, qc2, qc3, qc4 = st.columns(4)
@@ -934,33 +916,33 @@ with page_screener:
     filt = scr.copy()
     if sector_sel != "All Sectors":
         filt = filt[filt["Sector"] == sector_sel]
-    filt = filt[(filt["Mkt Cap (₹LCr)"].isna())  | (filt["Mkt Cap (₹LCr)"]  >= mc_min_l)]
-    filt = filt[(filt["P/E"].isna())                | (filt["P/E"]               <= pe_max)]
-    filt = filt[(filt["PEG"].isna())                | (filt["PEG"]               <= peg_max)]
-    filt = filt[(filt["ROE%"].isna())               | (filt["ROE%"]              >= roe_min_f)]
-    filt = filt[(filt["Int Coverage"].isna())       | (filt["Int Coverage"]      >= ic_min_f)]
-    filt = filt[(filt["Op Margin%"].isna())         | (filt["Op Margin%"]        >= om_min_f)]
-    filt = filt[(filt["Quality Score"].isna())      | (filt["Quality Score"]     >= qual_min_f)]
-    filt = filt[(filt["Momentum Score"].isna())     | (filt["Momentum Score"]    >= mom_min)]
-    filt = filt[(filt["Earn Traj"].isna())          | (filt["Earn Traj"]         >= et_min)]
+    filt = filt[(filt[COL_MC].isna())              | (filt[COL_MC]              >= mc_min_l)]
+    filt = filt[(filt["P/E"].isna())               | (filt["P/E"]               <= pe_max)]
+    filt = filt[(filt["PEG"].isna())               | (filt["PEG"]               <= peg_max)]
+    filt = filt[(filt["ROE%"].isna())              | (filt["ROE%"]              >= roe_min_f)]
+    filt = filt[(filt["Int Coverage"].isna())      | (filt["Int Coverage"]      >= ic_min_f)]
+    filt = filt[(filt["Op Margin%"].isna())        | (filt["Op Margin%"]        >= om_min_f)]
+    filt = filt[(filt["Quality Score"].isna())     | (filt["Quality Score"]     >= qual_min_f)]
+    filt = filt[(filt["Momentum Score"].isna())    | (filt["Momentum Score"]    >= mom_min)]
+    filt = filt[(filt["Earn Traj"].isna())         | (filt["Earn Traj"]         >= et_min)]
 
     sort_map = {
-        "Sector then Rank":           (["Sector", "Rank"],       [True,  True]),
-        "Score high to low":          (["Score"],                [False]),
-        "Conviction high to low":     (["Conviction Score"],     [False]),
-        "MC% of Nifty50 high to low": (["MC% of Nifty50"],      [False]),
-        "Price low to high":          (["Price (Rs)"],           [True]),
-        "Price high to low":          (["Price (Rs)"],           [False]),
-        "Mkt Cap high to low":        (["Mkt Cap (₹LCr)"],     [False]),
-        "PE low to high":             (["P/E"],                  [True]),
-        "Fwd PE low to high":         (["Fwd P/E"],              [True]),
-        "PEG low to high":            (["PEG"],                  [True]),
-        "Quality Score high":         (["Quality Score"],        [False]),
-        "ROE high to low":            (["ROE%"],                 [False]),
-        "Earn Traj high to low":      (["Earn Traj"],            [False]),
-        "Momentum Score high":        (["Momentum Score"],       [False]),
-        "52W Pos low to high":        (["52W Pos%"],             [True]),
-        "Rev Growth high to low":     (["Rev Growth% (YoY)"],    [False]),
+        "Sector then Rank":           (["Sector", "Rank"],  [True,  True]),
+        "Score high to low":          (["Score"],           [False]),
+        "Conviction high to low":     (["Conviction Score"],[False]),
+        "MC% of Nifty50 high to low": (["MC% of Nifty50"], [False]),
+        "Price low to high":          (["Price (Rs)"],      [True]),
+        "Price high to low":          (["Price (Rs)"],      [False]),
+        "Mkt Cap high to low":        ([COL_MC],            [False]),
+        "PE low to high":             (["P/E"],             [True]),
+        "Fwd PE low to high":         (["Fwd P/E"],         [True]),
+        "PEG low to high":            (["PEG"],             [True]),
+        "Quality Score high":         (["Quality Score"],   [False]),
+        "ROE high to low":            (["ROE%"],            [False]),
+        "Earn Traj high to low":      (["Earn Traj"],       [False]),
+        "Momentum Score high":        (["Momentum Score"],  [False]),
+        "52W Pos low to high":        (["52W Pos%"],        [True]),
+        "Rev Growth high to low":     (["Rev Growth% (YoY)"],[False]),
     }
     sc, sa = sort_map.get(sort_by, (["Sector", "Rank"], [True, True]))
     filt   = filt.sort_values(sc, ascending=sa, na_position="last")
@@ -969,15 +951,15 @@ with page_screener:
         len(filt), len(scr), sector_sel, sort_by))
 
     disp = filt.copy()
-    for c in [
+    round_cols = [
         "P/E", "Fwd P/E", "PEG", "Earn Traj", "52W Pos%",
         "ROIC% (ROA)", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
         "Quality Score", "Momentum Score", "Ret 1Mo%", "Ret 3Mo%",
         "Ret 6Mo%", "Trailing Vol%", "Score", "Conviction Score",
         "Rev Growth% (YoY)", "MC% of Nifty50", "Price (Rs)",
-        "Mkt Cap (₹LCr)",
-        "Rev Q1 (₹TCr)", "Rev Q2 (₹TCr)", "Rev Q3 (₹TCr)", "Rev Q4 (₹TCr)",
-    ]:
+        COL_MC, COL_RQ1, COL_RQ2, COL_RQ3, COL_RQ4,
+    ]
+    for c in round_cols:
         if c in disp.columns:
             disp[c] = disp[c].round(2)
 
@@ -989,16 +971,15 @@ with page_screener:
     )
     disp["Rank"] = disp["Rank"].apply(lambda v: int(v) if pd.notna(v) else pd.NA)
 
-    # PEG Method column intentionally excluded from display
     COLS = [
         "Ticker", "Sector",
-        "Price (Rs)", "52W Pos%", "Mkt Cap (₹LCr)", "MC% of Nifty50",
+        "Price (Rs)", "52W Pos%", COL_MC, "MC% of Nifty50",
         "P/E", "Fwd P/E", "PEG", "Earn Traj",
         "ROIC% (ROA)", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
         "Quality Score", "Quality Flag",
         "Momentum Score", "Ret 1Mo%", "Ret 3Mo%", "Ret 6Mo%", "Trailing Vol%",
         "Score", "Conviction Score", "Rank",
-        "Rev Q1 (₹TCr)", "Rev Q2 (₹TCr)", "Rev Q3 (₹TCr)", "Rev Q4 (₹TCr)",
+        COL_RQ1, COL_RQ2, COL_RQ3, COL_RQ4,
         "Rev Growth% (YoY)",
     ]
     disp_final = disp[[c for c in COLS if c in disp.columns]].copy()
@@ -1014,23 +995,22 @@ with page_screener:
     st.markdown("---")
     st.markdown("**Column Glossary**")
     st.markdown(
-        "- **Mkt Cap (₹LCr)**: Market cap in ₹Lakh Crore (1 LCr = ₹1,00,000 Cr = 10^12).\n"
-        "- **Rev Q1-Q4 (₹TCr)**: Quarterly revenue in ₹Thousand Crore (1 TCr = ₹1,000 Cr = 10^11).\n"
+        "- **{mc}**: Market cap in Rs Lakh Crore (1 LCr = Rs 1,00,000 Cr = 10^12).\n"
+        "- **{rq1} to {rq4}**: Quarterly revenue in Rs Thousand Crore (1 = Rs 1,000 Cr = 10^11).\n"
         "- **P/E**: Trailing twelve months P/E from yfinance trailingPE.\n"
         "- **Fwd P/E**: Forward P/E from yfinance forwardPE (analyst consensus).\n"
-        "- **PEG**: From yfinance pegRatio if available; else calculated from Fwd P/E / EPS growth.\n"
+        "- **PEG**: From yfinance pegRatio if available; else Fwd P/E / EPS growth (>= 5% only).\n"
         "- **Earn Traj**: YoY EPS change from quarterly income statement, clamped to [-1, +1].\n"
-        "- **ROIC% (ROA)**: Return on Assets used as ROIC proxy (decimal converted to %).\n"
-        "- **ROE%**: Return on Equity (decimal converted to %).\n"
+        "- **ROIC% (ROA)**: Return on Assets as ROIC proxy (decimal to %).\n"
+        "- **ROE%**: Return on Equity (decimal to %).\n"
         "- **Int Coverage**: EBIT / Interest Expense from annual income statement. Capped at 100x.\n"
-        "- **Op Margin%**: Operating margin (decimal converted to %).\n"
-        "- **Debt/Eq**: Debt-to-equity ratio from yfinance debtToEquity.\n"
+        "- **Op Margin%**: Operating margin (decimal to %).\n"
+        "- **Debt/Eq**: Debt-to-equity from yfinance debtToEquity.\n"
         "- **Quality Score**: 0-100 composite of ROE/ROIC + Int Coverage + Op Margin.\n"
-        "- **Momentum Score**: (6M return - 1M return) / trailing annualised volatility.\n"
-        "- **Ret 1/3/6 Mo%**: Price returns over 1, 3, and 6 months.\n"
-        "- **Trailing Vol%**: Annualised daily return std dev over last 90 trading days.\n"
-        "- **Score**: Sector-relative percentile. Valuation 25% + Quality 25% + PEG 20% + Earn Traj 15% + Momentum 15%.\n"
-        "- **Rank**: Within-sector rank by Score (1 = best).\n"
+        "- **Momentum Score**: (6M return - 1M return) / annualised volatility.\n"
+        "- **Score**: Valuation 25% + Quality 25% + PEG 20% + Earn Traj 15% + Momentum 15%.\n"
+        "- **Rank**: Within-sector rank by Score (1 = best).\n".format(
+            mc=COL_MC, rq1=COL_RQ1, rq2=COL_RQ2, rq3=COL_RQ3, rq4=COL_RQ4)
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1038,35 +1018,27 @@ with page_screener:
 # ══════════════════════════════════════════════════════════════════════════════
 with page_about:
     st.markdown("## About - Nifty 50 Screener v7")
-
     st.markdown("### Data Sources")
     st.markdown(
-        "| Field | yfinance source | Unit in table |\n"
+        "| Field | yfinance source | Unit |\n"
         "|---|---|---|\n"
-        "| Price | currentPrice / regularMarketPrice | ₹|\n"
-        "| Market Cap | marketCap | ₹Lakh Cr |\n"
-        "| 52W High/Low | fiftyTwoWeekHigh/Low | ₹|\n"
+        "| Price | currentPrice / regularMarketPrice | Rs |\n"
+        "| Market Cap | marketCap | Rs Lakh Cr |\n"
         "| Trailing P/E | trailingPE | x |\n"
         "| Forward P/E | forwardPE | x |\n"
-        "| PEG | pegRatio (or calculated) | x |\n"
-        "| ROE | returnOnEquity (decimal to %) | % |\n"
-        "| ROIC proxy | returnOnAssets (decimal to %) | % |\n"
-        "| Op Margin | operatingMargins (decimal to %) | % |\n"
+        "| PEG | pegRatio or calculated | x |\n"
+        "| ROE | returnOnEquity | % |\n"
+        "| ROIC proxy | returnOnAssets | % |\n"
+        "| Op Margin | operatingMargins | % |\n"
         "| Int Coverage | EBIT/InterestExpense from income_stmt | x |\n"
         "| Debt/Equity | debtToEquity | ratio |\n"
-        "| EPS (quarterly) | quarterly_income_stmt | for Earn Traj |\n"
-        "| Revenue (quarterly) | quarterly_income_stmt | ₹Thousand Cr |\n"
+        "| Revenue (quarterly) | quarterly_income_stmt | Rs Thousand Cr |\n"
         "| Momentum | yf.download() price history | score |\n"
         "| Universe | Wikipedia NIFTY_50 | cached 24h |\n"
     )
-
     st.markdown("### Scoring Model")
     st.code(
-        "Score = 25% Valuation (P/E percentile, lower = better)\n"
-        "      + 25% Quality   (ROE/ROIC + Int Coverage + Op Margin)\n"
-        "      + 20% PEG       (lower = better, only when EPS growth >= 5%)\n"
-        "      + 15% Earn Traj (YoY EPS direction, -1 to +1)\n"
-        "      + 15% Momentum  (6M-1M skip return / trailing volatility)",
+        "Score = 25% Valuation + 25% Quality + 20% PEG + 15% Earn Traj + 15% Momentum",
         language=None,
     )
 
@@ -1084,7 +1056,7 @@ with page_debug:
     if st.button("Run diagnostic"):
         with st.spinner("Testing {}...".format(test_yf)):
 
-            st.markdown("### 1. yfinance .info (fundamentals)")
+            st.markdown("### 1. yfinance .info")
             try:
                 t_obj = yf.Ticker(test_yf)
                 info  = t_obj.info or {}
@@ -1100,7 +1072,7 @@ with page_debug:
                         "trailingEps", "forwardEps",
                     ]})
                 else:
-                    st.error("yfinance .info returned no price for {}".format(test_yf))
+                    st.error("No price returned for {}".format(test_yf))
             except Exception as ex:
                 st.error("yfinance .info error: {}".format(ex))
 
@@ -1129,7 +1101,7 @@ with page_debug:
                         st.success("{} OK — {} rows x {} quarters".format(
                             attr, len(df), len(df.columns)))
                         st.dataframe(df.head(6))
-                        rev4  = _quarterly_revenues(t_obj)
+                        rev4         = _quarterly_revenues(t_obj)
                         eps_r, eps_o = _quarterly_eps(t_obj)
                         et = None
                         if eps_r and eps_o and abs(eps_o) > 0.001:
@@ -1137,13 +1109,13 @@ with page_debug:
                             et     = max(-1.0, min(1.0, raw_et / 2.0))
                         rg = revenue_growth_yoy(rev4)
                         st.json({
-                            "Rev Q1 raw (INR)":  rev4[0],
-                            "Rev Q4 raw (INR)":  rev4[3],
-                            "Rev Q1 (₹TCr)":   (rev4[0] / 1e11) if rev4[0] else None,
-                            "Rev YoY Growth%":   rg,
-                            "EPS recent":        eps_r,
-                            "EPS 1yr ago":       eps_o,
-                            "Earn Traj":         et,
+                            "Rev Q1 raw (INR)":   rev4[0],
+                            "Rev Q4 raw (INR)":   rev4[3],
+                            "Rev Q1 (1000Cr)":    (rev4[0] / 1e11) if rev4[0] else None,
+                            "Rev YoY Growth%":    rg,
+                            "EPS recent":         eps_r,
+                            "EPS 1yr ago":        eps_o,
+                            "Earn Traj":          et,
                         })
                         break
                 else:
@@ -1161,12 +1133,11 @@ with page_debug:
                         close_col = close_col.iloc[:, 0]
                     closes = pd.to_numeric(close_col, errors="coerce").dropna()
                     latest = float(closes.iloc[-1])
-                    st.success("Price history OK — {} rows, latest close: {:.2f}".format(
+                    st.success("Price history OK — {} rows, latest: {:.2f}".format(
                         len(hist), latest))
-
-                    hist_m = yf.download(test_yf, period="7mo", interval="1mo",
-                                         auto_adjust=True, progress=False)
-                    close_m = hist_m["Close"]
+                    hist_m   = yf.download(test_yf, period="7mo", interval="1mo",
+                                           auto_adjust=True, progress=False)
+                    close_m  = hist_m["Close"]
                     if isinstance(close_m, pd.DataFrame):
                         close_m = close_m.iloc[:, 0]
                     closes_m = pd.to_numeric(close_m, errors="coerce").dropna()
@@ -1185,11 +1156,8 @@ with page_debug:
                     skip = (r6 - r1) if (r6 and r1) else None
                     mom  = round(skip / vol, 3) if (skip and vol and vol > 0) else skip
                     st.json({
-                        "Ret 1Mo%":       r1,
-                        "Ret 3Mo%":       r3,
-                        "Ret 6Mo%":       r6,
-                        "Trailing Vol%":  vol,
-                        "Momentum Score": mom,
+                        "Ret 1Mo%": r1, "Ret 3Mo%": r3, "Ret 6Mo%": r6,
+                        "Trailing Vol%": vol, "Momentum Score": mom,
                     })
                 else:
                     st.warning("Price history empty for {}".format(test_yf))
