@@ -1,4 +1,4 @@
-# app.py  (Nifty Screener v8 — simplified filters + comparison fixes)
+# app.py  (Nifty Screener v9 — momentum fix + analysis box toggle)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,7 +8,7 @@ import time
 import re
 import warnings
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta
 import math
 
 warnings.filterwarnings("ignore")
@@ -416,48 +416,53 @@ def fetch_yf_fundamentals(tickers):
     prog.empty(); stat.empty()
     return out
 
-# ─── Momentum — per-ticker individual downloads ───────────────────────────────
+# ─── Momentum — Ticker.history() based (most reliable for .NS) ───────────────
 @st.cache_data(ttl=3600)
 def fetch_momentum_batch(tickers):
     """
-    Downloads price history individually per ticker.
-    Using individual downloads (not bulk) prevents the MultiIndex column
-    ambiguity that causes all momentum values to be identical or None.
+    Uses yf.Ticker(t).history() instead of yf.download() to avoid
+    MultiIndex / session-conflict issues that affect .NS tickers.
+    history() returns a clean single-level DataFrame per ticker.
     """
     tl  = list(tickers)
     out = {t: {} for t in tl}
 
-    def _get_close(df):
-        """Safely extract a clean float Series from a single-ticker yf.download result."""
-        if df is None or df.empty:
-            return pd.Series(dtype=float)
-        # Single ticker download returns flat columns — just grab Close
-        if isinstance(df.columns, pd.MultiIndex):
-            # Shouldn't happen for single-ticker but handle defensively
-            try:
-                col = df["Close"].iloc[:, 0]
-            except Exception:
-                return pd.Series(dtype=float)
-        else:
-            if "Close" not in df.columns:
-                return pd.Series(dtype=float)
-            col = df["Close"]
-        if isinstance(col, pd.DataFrame):
-            col = col.iloc[:, 0]
-        return pd.to_numeric(col, errors="coerce").dropna()
-
     def _process_single(t):
         try:
-            # Download daily and monthly separately — always single ticker
-            raw_d = yf.download(t, period="7mo", interval="1d",
-                                auto_adjust=True, progress=False,
-                                group_by="ticker")
-            raw_m = yf.download(t, period="7mo", interval="1mo",
-                                auto_adjust=True, progress=False,
-                                group_by="ticker")
+            ticker_obj = yf.Ticker(t)
 
-            closes_d = _get_close(raw_d)
-            closes_m = _get_close(raw_m)
+            # ── Daily history: last 9 months for volatility ───────────────────
+            end_d   = datetime.today()
+            start_d = end_d - timedelta(days=275)          # ~9 months
+            hist_d  = ticker_obj.history(
+                start=start_d.strftime("%Y-%m-%d"),
+                end=end_d.strftime("%Y-%m-%d"),
+                interval="1d",
+                auto_adjust=True,
+                actions=False,
+            )
+            # ── Monthly history: last 8 months for return calc ────────────────
+            start_m = end_d - timedelta(days=245)          # ~8 months
+            hist_m  = ticker_obj.history(
+                start=start_m.strftime("%Y-%m-%d"),
+                end=end_d.strftime("%Y-%m-%d"),
+                interval="1mo",
+                auto_adjust=True,
+                actions=False,
+            )
+
+            # Flatten MultiIndex if somehow present
+            def _clean(df):
+                if df is None or df.empty:
+                    return pd.Series(dtype=float)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                if "Close" not in df.columns:
+                    return pd.Series(dtype=float)
+                return pd.to_numeric(df["Close"], errors="coerce").dropna()
+
+            closes_d = _clean(hist_d)
+            closes_m = _clean(hist_m)
 
             if len(closes_m) < 2:
                 return t, {}
@@ -465,21 +470,25 @@ def fetch_momentum_batch(tickers):
             px_now = float(closes_m.iloc[-1])
 
             def ret_mo(n):
-                idx = -(n+1)
-                if abs(idx) > len(closes_m): return None
+                """Return from n months ago to now (monthly bar index)."""
+                idx = -(n + 1)
+                if abs(idx) > len(closes_m):
+                    return None
                 px = float(closes_m.iloc[idx])
-                return (px_now/px - 1)*100.0 if px > 0 else None
+                return (px_now / px - 1) * 100.0 if px > 0 else None
 
             r1 = ret_mo(1)
             r3 = ret_mo(3)
             r6 = ret_mo(6)
 
+            # Trailing annualised vol from daily returns (last 90 trading days)
             trailing_vol = None
             if len(closes_d) >= 20:
                 dr = closes_d.pct_change().dropna().tail(90)
                 if len(dr) >= 15:
                     trailing_vol = float(dr.std() * np.sqrt(252) * 100.0)
 
+            # Skip-month momentum: (6mo return - 1mo return) / vol
             skip = (r6 - r1) if (r6 is not None and r1 is not None) else None
             mom  = None
             if skip is not None and trailing_vol and trailing_vol > 0:
@@ -488,24 +497,27 @@ def fetch_momentum_batch(tickers):
                 mom = skip
 
             return t, {
-                "ret_1mo": r1, "ret_3mo": r3, "ret_6mo": r6,
-                "trailing_vol": trailing_vol, "momentum_score": mom,
+                "ret_1mo":        r1,
+                "ret_3mo":        r3,
+                "ret_6mo":        r6,
+                "trailing_vol":   trailing_vol,
+                "momentum_score": mom,
             }
         except Exception:
             return t, {}
 
-    # ✅ Serial processing — no threading for momentum
-    # Threading + yf.download causes session conflicts that produce
-    # identical values across all tickers. Serial is slower but correct.
-    CHUNK=5; SLEEP=0.3; chunks=[tl[i:i+CHUNK] for i in range(0,len(tl),CHUNK)]
-    prog=st.progress(0); stat=st.empty()
+    # Serial processing in chunks — avoids yfinance session contention
+    CHUNK = 5; SLEEP = 0.3
+    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+    prog = st.progress(0); stat = st.empty()
     for ci, chunk in enumerate(chunks):
-        stat.text("Fetching momentum: {}/{} tickers...".format(min(ci*CHUNK,len(tl)),len(tl)))
+        stat.text("Fetching momentum: {}/{} tickers...".format(min(ci*CHUNK, len(tl)), len(tl)))
         for t in chunk:
             t_res, d = _process_single(t)
             out[t_res] = d
-        prog.progress((ci+1)/len(chunks))
-        if ci < len(chunks)-1: time.sleep(SLEEP)
+        prog.progress((ci+1) / len(chunks))
+        if ci < len(chunks)-1:
+            time.sleep(SLEEP)
     prog.empty(); stat.empty()
     return out
 
@@ -647,7 +659,11 @@ def build_screener_table(universe_df, yf_fundamentals, momentum_map):
     return scr
 
 # ─── Shared screener UI ───────────────────────────────────────────────────────
-def render_screener_ui(scr, index_label):
+def render_screener_ui(scr, index_label, show_analysis_box=True):
+    """
+    show_analysis_box=False  →  hides the 'Analysis — Nifty XX — All Sectors'
+    KPI panel entirely. Pass False from Pages 1 & 2.
+    """
     def _kpi(label, value, sub, color="#ffffff"):
         return (
             "<div style='background:#1e1e2e;border-radius:10px;padding:14px 16px;"
@@ -658,7 +674,7 @@ def render_screener_ui(scr, index_label):
             "</div>"
         ).format(label, color, value, sub)
 
-    # ✅ FIX: 5 filters in one single row — Sector, Sort by, Min Mkt Cap, Max PE, Max PEG
+    # ── Filters row ───────────────────────────────────────────────────────────
     f1, f2, f3, f4, f5 = st.columns(5)
     all_sectors = sorted(scr["Sector"].dropna().unique().tolist())
     sector_sel  = f1.selectbox("Sector", ["All Sectors"]+all_sectors, key=index_label+"_sec")
@@ -674,38 +690,44 @@ def render_screener_ui(scr, index_label):
     pe_max   = f4.number_input("Max PE",            value=9999, step=10,  key=index_label+"_pe")
     peg_max  = f5.number_input("Max PEG",           value=999.0,step=1.0, key=index_label+"_peg")
 
-    # KPI panel
-    is_all   = (sector_sel == "All Sectors")
-    kpi_label = "{} — All Sectors".format(index_label) if is_all else "{} — {}".format(index_label, sector_sel)
-    total_mc = scr["Mkt Cap Raw"].sum()
-    sdata    = scr.copy() if is_all else scr[scr["Sector"]==sector_sel]
-    sec_mc   = sdata["Mkt Cap Raw"].sum()
-    pct      = 100.0 if is_all else (sec_mc/total_mc*100.0 if total_mc>0 else 0.0)
-    med_pe   = sdata["P/E"].median()
-    med_qual = sdata["Quality Score"].median()
-    med_peg  = sdata["PEG"].median()
+    # ── Analysis / KPI panel — conditionally rendered ─────────────────────────
+    is_all    = (sector_sel == "All Sectors")
+    kpi_label = (
+        "{} — All Sectors".format(index_label) if is_all
+        else "{} — {}".format(index_label, sector_sel)
+    )
+    total_mc  = scr["Mkt Cap Raw"].sum()
+    sdata     = scr.copy() if is_all else scr[scr["Sector"]==sector_sel]
+    sec_mc    = sdata["Mkt Cap Raw"].sum()
+    pct       = 100.0 if is_all else (sec_mc/total_mc*100.0 if total_mc>0 else 0.0)
+    med_pe    = sdata["P/E"].median()
+    med_qual  = sdata["Quality Score"].median()
+    med_peg   = sdata["PEG"].median()
 
-    st.markdown(
-        "<div style='background:#12122a;border:1px solid #2a2a4a;border-radius:12px;"
-        "padding:16px 20px;margin-bottom:16px;margin-top:12px;'>"
-        "<span style='color:#aaa;font-size:13px;'>Analysis  </span>"
-        "<span style='color:#fff;font-size:14px;font-weight:700;'>{}</span>"
-        "</div>".format(kpi_label), unsafe_allow_html=True)
+    # Only show if caller requests it (sector-drill-down context)
+    if show_analysis_box:
+        st.markdown(
+            "<div style='background:#12122a;border:1px solid #2a2a4a;border-radius:12px;"
+            "padding:16px 20px;margin-bottom:16px;margin-top:12px;'>"
+            "<span style='color:#aaa;font-size:13px;'>Analysis  </span>"
+            "<span style='color:#fff;font-size:14px;font-weight:700;'>{}</span>"
+            "</div>".format(kpi_label), unsafe_allow_html=True)
 
-    c1,c2,c3,c4,c5,c6=st.columns(6)
-    c1.markdown(_kpi("Sector Mkt Cap",fmt_mc_inr(sec_mc),"Rs Lakh Cr"),unsafe_allow_html=True)
-    c2.markdown(_kpi("Index Mkt Cap",fmt_mc_inr(total_mc),"Rs Lakh Cr"),unsafe_allow_html=True)
-    c3.markdown(_kpi("Sector Share","{:.1f}%".format(pct),"{} stocks".format(len(sdata))),unsafe_allow_html=True)
-    c4.markdown(_kpi("Median P/E",
-                     "{:.1f}".format(med_pe) if pd.notna(med_pe) else "N/A",
-                     "trailing twelve months","#facc15"),unsafe_allow_html=True)
-    c5.markdown(_kpi("Median Quality",
-                     "{:.0f}/100".format(med_qual) if pd.notna(med_qual) else "N/A",
-                     "ROE+IntCov+Margin","#4ade80"),unsafe_allow_html=True)
-    c6.markdown(_kpi("Median PEG",
-                     "{:.2f}".format(med_peg) if pd.notna(med_peg) else "N/A",
-                     "price/earnings/growth","#a78bfa"),unsafe_allow_html=True)
+        c1,c2,c3,c4,c5,c6=st.columns(6)
+        c1.markdown(_kpi("Sector Mkt Cap",fmt_mc_inr(sec_mc),"Rs Lakh Cr"),unsafe_allow_html=True)
+        c2.markdown(_kpi("Index Mkt Cap",fmt_mc_inr(total_mc),"Rs Lakh Cr"),unsafe_allow_html=True)
+        c3.markdown(_kpi("Sector Share","{:.1f}%".format(pct),"{} stocks".format(len(sdata))),unsafe_allow_html=True)
+        c4.markdown(_kpi("Median P/E",
+                         "{:.1f}".format(med_pe) if pd.notna(med_pe) else "N/A",
+                         "trailing twelve months","#facc15"),unsafe_allow_html=True)
+        c5.markdown(_kpi("Median Quality",
+                         "{:.0f}/100".format(med_qual) if pd.notna(med_qual) else "N/A",
+                         "ROE+IntCov+Margin","#4ade80"),unsafe_allow_html=True)
+        c6.markdown(_kpi("Median PEG",
+                         "{:.2f}".format(med_peg) if pd.notna(med_peg) else "N/A",
+                         "price/earnings/growth","#a78bfa"),unsafe_allow_html=True)
 
+    # Top-ranked badges — shown only when a specific sector is selected
     if not is_all:
         top3=sdata[sdata["Rank"].notna()].sort_values("Rank").head(3)
         badges="  ".join(
@@ -721,7 +743,7 @@ def render_screener_ui(scr, index_label):
             unsafe_allow_html=True)
     st.markdown("<div style='margin-bottom:12px;'></div>", unsafe_allow_html=True)
 
-    # Apply filters
+    # ── Apply filters ─────────────────────────────────────────────────────────
     filt=scr.copy()
     if not is_all: filt=filt[filt["Sector"]==sector_sel]
     filt=filt[(filt[COL_MC].isna())|(filt[COL_MC]>=mc_min_l)]
@@ -832,7 +854,8 @@ with pg1:
     if scr50.empty:
         st.error("No data returned.")
     else:
-        render_screener_ui(scr50,"Nifty 50")
+        # ✅ show_analysis_box=False hides the "Analysis — Nifty 50 — All Sectors" panel
+        render_screener_ui(scr50, "Nifty 50", show_analysis_box=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE 2 — NIFTY 500
@@ -876,7 +899,8 @@ with pg2:
         if scr500.empty:
             st.error("No data returned.")
         else:
-            render_screener_ui(scr500,"Nifty 500")
+            # ✅ show_analysis_box=False hides the "Analysis — Nifty 500 — All Sectors" panel
+            render_screener_ui(scr500, "Nifty 500", show_analysis_box=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE 3 — STOCK COMPARISON
@@ -912,11 +936,8 @@ with pg3:
             comp_fd =fetch_yf_fundamentals(comp_tickers)
             comp_mom=fetch_momentum_batch(comp_tickers)
 
-        # ── Metrics definition ────────────────────────────────────────────────
-        # Each entry: (display_name, extractor_fn, colour_direction)
-        # colour_direction: "higher"=green when highest, "lower"=green when lowest, None=no colour
         COMP_METRICS=[
-            ("Price (Rs)",     lambda fd,m: fd.get("price"),           None),        # ✅ no colouring
+            ("Price (Rs)",     lambda fd,m: fd.get("price"),           None),
             ("Mkt Cap (LCr)",  lambda fd,m: (fd.get("mc")/1e12) if fd.get("mc") else None, "higher"),
             ("P/E",            lambda fd,m: fd.get("pe"),               "lower"),
             ("Fwd P/E",        lambda fd,m: fd.get("fwd_pe"),           "lower"),
@@ -940,7 +961,6 @@ with pg3:
 
         display_names=[t.replace(".NS","") for t in comp_tickers]
 
-        # Build raw values dict
         raw_vals={m[0]: {} for m in COMP_METRICS}
         for t in comp_tickers:
             fd =comp_fd.get(t,{})
@@ -952,7 +972,6 @@ with pg3:
                     round(float(v),2) if v is not None and not (isinstance(v,float) and np.isnan(v))
                     else None)
 
-        # Build styled HTML table
         header_cells="".join(
             "<th style='padding:10px 14px;background:#1a1a2e;color:#93c5fd;"
             "font-weight:700;text-align:right;border-bottom:2px solid #2a2a4a;'>{}</th>".format(n)
@@ -965,7 +984,6 @@ with pg3:
             vals=raw_vals[metric_name]
             nums={k:v for k,v in vals.items() if v is not None}
 
-            # Determine best/worst for colouring
             best_key=worst_key=None
             if direction and len(nums)>=2:
                 if direction=="higher":
@@ -984,13 +1002,12 @@ with pg3:
                 v=vals.get(name)
                 disp_v="{:.2f}".format(v) if v is not None else "—"
 
-                # ✅ FIX: Price (Rs) has direction=None so never gets coloured
                 if direction is None or best_key is None:
                     style="color:#fff;"
                 elif name==best_key:
-                    style="color:#4ade80;font-weight:700;"    # green = best
+                    style="color:#4ade80;font-weight:700;"
                 elif name==worst_key:
-                    style="color:#f87171;font-weight:700;"    # red = worst
+                    style="color:#f87171;font-weight:700;"
                 else:
                     style="color:#fff;"
 
@@ -1016,7 +1033,6 @@ with pg3:
             "Price (Rs) has no colouring (absolute values, not comparable)"
             "</div>", unsafe_allow_html=True)
 
-        # ── Radar chart ───────────────────────────────────────────────────────
         st.markdown("#### Radar: Normalised Metric Comparison")
         st.caption("Each metric normalised 0–100 within selected stocks. Higher = better on all axes.")
 
@@ -1094,7 +1110,6 @@ with pg3:
             +"".join(svg)+
             "</svg></div>",unsafe_allow_html=True)
 
-        # Download
         comp_export=pd.DataFrame({m[0]:{t.replace(".NS",""):raw_vals[m[0]].get(t.replace(".NS",""))
                                         for t in comp_tickers}
                                    for m in COMP_METRICS}).T
