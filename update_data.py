@@ -101,6 +101,9 @@ class _NoOp:
     def __ge__(self, other):
         return False
 
+    def __hash__(self):
+        return id(self)
+
 
 def _cache_data_decorator(fn):
     return fn
