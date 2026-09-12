@@ -42,8 +42,17 @@ jobs:
       - name: Evaluate predictions and train ML models
         run: python evaluate_predictions.py
 
-      - name: Commit latest snapshots
+      - name: Commit latest snapshots and ML reports
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: update screener snapshots [skip ci]"
-          file_pattern: "data/latest_screener_nifty50.parquet data/latest_screener_nifty50.csv data/latest_screener_nifty500.parquet data/latest_screener_nifty500.csv"
+          commit_message: "chore: update screener snapshots and ML reports [skip ci]"
+          file_pattern: |
+            data/latest_screener_nifty50.parquet
+            data/latest_screener_nifty50.csv
+            data/latest_screener_nifty500.parquet
+            data/latest_screener_nifty500.csv
+            data/evaluation/ml_metrics.json
+            data/evaluation/ml_predictions_*.parquet
+            data/evaluation/ml_portfolio_*.csv
+            data/evaluation/ic_summary.csv
+            data/evaluation/backtest_top20_*.csv
