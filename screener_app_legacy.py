@@ -1043,90 +1043,107 @@ def fetch_yf_fundamentals(tickers: tuple) -> dict:
 # ─── Momentum ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def fetch_momentum_batch(tickers):
+    """Fetch momentum metrics using a bulk Yahoo Finance download.
+
+    Bulk download is far more reliable than per-ticker history calls and avoids
+    Yahoo's per-ticker rate limits. Falls back to single-ticker history only when
+    a ticker is missing from the bulk result.
+    """
     tl  = list(tickers)
     out = {t: {} for t in tl}
+    if not tl:
+        return out
+
+    # One bulk call for ~1 year of daily closes for all tickers.
+    bulk = None
+    try:
+        bulk = yf.download(
+            tickers=" ".join(tl),
+            period="1y",
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+    except Exception:
+        bulk = None
+
+    is_multi = False
+    if bulk is not None and not bulk.empty and isinstance(bulk.columns, pd.MultiIndex):
+        is_multi = True
+
+    def _close_series(t):
+        """Return a clean daily close Series for ticker t from the bulk download."""
+        if bulk is None or bulk.empty:
+            return None
+        try:
+            if len(tl) == 1:
+                close = bulk.get("Close")
+            elif is_multi:
+                if t not in bulk.columns.get_level_values(0):
+                    return None
+                close = bulk[t].get("Close")
+            else:
+                close = bulk.get("Close")
+            if close is None or close.empty:
+                return None
+            s = pd.to_numeric(close, errors="coerce").dropna()
+            return s if len(s) >= 2 else None
+        except Exception:
+            return None
 
     def _process_single(t):
-        try:
-            ticker_obj = yf.Ticker(t)
-            end_d   = datetime.today()
-            start_d = end_d - timedelta(days=275)
-            start_m = end_d - timedelta(days=245)
-
-            hist_d = ticker_obj.history(
-                start=start_d.strftime("%Y-%m-%d"),
-                end=end_d.strftime("%Y-%m-%d"),
-                interval="1d", auto_adjust=True, actions=False)
-            hist_m = ticker_obj.history(
-                start=start_m.strftime("%Y-%m-%d"),
-                end=end_d.strftime("%Y-%m-%d"),
-                interval="1mo", auto_adjust=True, actions=False)
-
-            def _clean(df):
-                if df is None or df.empty:
-                    return pd.Series(dtype=float)
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                if "Close" not in df.columns:
-                    return pd.Series(dtype=float)
-                return pd.to_numeric(df["Close"], errors="coerce").dropna()
-
-            closes_d = _clean(hist_d)
-            closes_m = _clean(hist_m)
-
-            if len(closes_m) < 2:
+        s = _close_series(t)
+        if s is None or len(s) < 22:
+            # Per-ticker fallback if the bulk download omitted this ticker.
+            try:
+                s = yf.Ticker(t).history(
+                    period="1y", interval="1d",
+                    auto_adjust=True, actions=False)["Close"]
+                s = pd.to_numeric(s, errors="coerce").dropna()
+            except Exception:
                 return t, {}
-
-            px_now = float(closes_m.iloc[-1])
-
-            def ret_mo(n):
-                idx = -(n + 1)
-                if abs(idx) > len(closes_m):
-                    return None
-                px = float(closes_m.iloc[idx])
-                return (px_now / px - 1) * 100.0 if px > 0 else None
-
-            r1 = ret_mo(1)
-            r3 = ret_mo(3)
-            r6 = ret_mo(6)
-
-            trailing_vol = None
-            if len(closes_d) >= 20:
-                dr = closes_d.pct_change().dropna().tail(90)
-                if len(dr) >= 15:
-                    trailing_vol = float(dr.std() * np.sqrt(252) * 100.0)
-
-            skip = (r6 - r1) if (r6 is not None and r1 is not None) else None
-            mom  = None
-            if skip is not None and trailing_vol and trailing_vol > 0:
-                mom = skip / trailing_vol
-            elif skip is not None:
-                mom = skip
-
-            return t, {
-                "ret_1mo":        r1,
-                "ret_3mo":        r3,
-                "ret_6mo":        r6,
-                "trailing_vol":   trailing_vol,
-                "momentum_score": mom,
-            }
-        except Exception:
+        if s is None or len(s) < 22:
             return t, {}
 
-    CHUNK = 5; SLEEP = 0.3
-    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
-    prog   = st.progress(0)
-    stat   = st.empty()
+        px_now = float(s.iloc[-1])
+        n = len(s)
 
-    for ci, chunk in enumerate(chunks):
-        stat.text("Fetching momentum: {}/{} tickers...".format(
-            min(ci * CHUNK, len(tl)), len(tl)))
-        for t in chunk:
-            t_res, d = _process_single(t)
-            out[t_res] = d
-        prog.progress((ci + 1) / len(chunks))
-        if ci < len(chunks) - 1:
-            time.sleep(SLEEP)
+        r1 = (px_now / float(s.iloc[-min(n, 22)]) - 1) * 100.0
+        r3 = (px_now / float(s.iloc[-min(n, 64)]) - 1) * 100.0 if n >= 64 else None
+        r6 = (px_now / float(s.iloc[-min(n, 127)]) - 1) * 100.0 if n >= 127 else None
+
+        trailing_vol = None
+        if n >= 30:
+            dr = s.pct_change().dropna().tail(90)
+            if len(dr) >= 15:
+                trailing_vol = float(dr.std() * np.sqrt(252) * 100.0)
+
+        skip = (r6 - r1) if (r6 is not None and r1 is not None) else None
+        mom = None
+        if skip is not None and trailing_vol and trailing_vol > 0:
+            mom = skip / trailing_vol
+        elif skip is not None:
+            mom = skip
+
+        return t, {
+            "ret_1mo":        r1,
+            "ret_3mo":        r3,
+            "ret_6mo":        r6,
+            "trailing_vol":   trailing_vol,
+            "momentum_score": mom,
+        }
+
+    CHUNK = 20
+    prog = st.progress(0)
+    stat = st.empty()
+    for i, t in enumerate(tl):
+        if i % CHUNK == 0:
+            stat.text("Fetching momentum: {}/{} tickers...".format(i, len(tl)))
+            prog.progress(min(1.0, i / len(tl)))
+        t_res, d = _process_single(t)
+        out[t_res] = d
     prog.empty()
     stat.empty()
     return out
@@ -1604,9 +1621,9 @@ def render_reference_guide():
         "v10.1 — dual-source (yfinance + Google Finance), sector-adaptive weights, true ROIC."
     )
 
-    tab_val, tab_qual, tab_peg, tab_etraj, tab_mom, tab_rank, tab_disp = st.tabs([
+    tab_val, tab_qual, tab_peg, tab_etraj, tab_mom, tab_rank, tab_disp, tab_gaps = st.tabs([
         "Valuation", "Quality", "PEG", "Earn Traj",
-        "Momentum", "Scoring & Rank", "Display Metrics",
+        "Momentum", "Scoring & Rank", "Display Metrics", "Data Gaps",
     ])
 
     with tab_val:
@@ -1704,6 +1721,12 @@ Only computed when EPS growth ≥ 5%.
 
 Skip-month removes short-term reversal noise.
 Higher = more durable trend per unit of risk.
+
+### Why momentum matters in stock screening
+- **Price follows fundamentals, but with a lag.** Momentum captures which stocks the market is already rewarding.
+- **Avoids value traps.** A cheap stock can stay cheap for years; positive momentum shows buyers are stepping in.
+- **Risk-adjusted view.** Dividing return by volatility tells you whether a stock is trending smoothly or making lottery-like spikes.
+- **Best combined with quality/valuation.** High momentum + reasonable valuation + strong quality = a higher-conviction idea.
 """)
 
     with tab_rank:
@@ -1755,6 +1778,27 @@ Per-row audit trail showing which source provided each metric.
 | Int Coverage | ~60% | ~60% |
 | Earn Traj | ~75% | ~75% |
 | Momentum | ~95% | ~95% |
+""")
+
+    with tab_gaps:
+        st.markdown("""
+### Why some cells are empty
+Empty cells in the screener simply mean **the data was not available** for that ticker from the sources we queried.
+
+Common reasons:
+| Reason | What it means |
+|---|---|
+| **New listing / SPAC / recent IPO** | Some tickers have no full-year history yet. |
+| **Yahoo Finance rate limiting** | Heavy batch requests can be throttled, especially for 500 stocks. The new bulk momentum download reduces this, but gaps can still happen. |
+| **No reported earnings** | Some small-cap or loss-making companies do not report the required quarterly data. |
+| **Different fiscal years** | Quarterly revenue timestamps may not line up, causing Rev Growth to be blank. |
+| **Google Finance fallback not triggered** | Fallbacks are used only when Yahoo returns nothing; they do not always fill every field. |
+
+### How to interpret empty values
+- **Missing P/E** → the company may be loss-making or data was unavailable.
+- **Missing Momentum** → price history was too short or the bulk download did not return prices for that ticker.
+- **Missing ROIC/ROE/Op Margin** → financial-statement data was incomplete.
+- **A blank is not a zero.** It means "we don't know," so the score for that factor is penalised rather than treated as bad.
 """)
 
     st.markdown("---")
