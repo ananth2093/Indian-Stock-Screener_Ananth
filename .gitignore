@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Screener generated artifacts that grow over time
+# latest_screener snapshots are intentionally kept so Streamlit Cloud can load them
+data/prediction_archive.parquet
+data/price_history.parquet
+data/evaluation/
