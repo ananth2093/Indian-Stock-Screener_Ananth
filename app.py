@@ -205,24 +205,40 @@ def _render_screener_page(scr: pd.DataFrame, title: str, csv_prefix: str):
     st.markdown(f"### {title}")
 
     # ── Sidebar filters ────────────────────────────────────────────────────────
+    key_prefix = csv_prefix.replace("_screener", "")
     all_sectors = sorted(scr["Sector"].dropna().unique().tolist())
     with st.sidebar:
         st.markdown(f"### {title} Filters")
-        sector_sel = st.selectbox("Sector", ["All Sectors"] + all_sectors)
-        sort_by = st.selectbox("Sort by", [
-            "Sector then Rank", "Overall Score high to low", "Score high to low",
-            "Conviction high to low", "MC% of Index high to low",
-            "Price low to high", "Price high to low", "Mkt Cap high to low",
-            "PE low to high", "Fwd PE low to high", "PEG low to high",
-            "Quality Score high", "ROIC high to low", "ROE high to low",
-            "Earn Traj high to low", "Rev Growth high to low",
-            "Momentum Score high", "52W Pos low to high",
-            "P/E vs Sector Med low to high",
-        ])
-        mc_min_l = st.number_input("Min Mkt Cap (LCr)", value=0, step=10, min_value=0)
-        pe_max = st.number_input("Max P/E", value=9999, step=50, min_value=0)
-        qual_min_f = st.number_input("Min Quality Score", value=0.0, step=5.0,
-                                     min_value=0.0, max_value=100.0)
+        sector_sel = st.selectbox(
+            "Sector", ["All Sectors"] + all_sectors,
+            key=f"{key_prefix}_sector",
+        )
+        sort_by = st.selectbox(
+            "Sort by", [
+                "Sector then Rank", "Overall Score high to low", "Score high to low",
+                "Conviction high to low", "MC% of Index high to low",
+                "Price low to high", "Price high to low", "Mkt Cap high to low",
+                "PE low to high", "Fwd PE low to high", "PEG low to high",
+                "Quality Score high", "ROIC high to low", "ROE high to low",
+                "Earn Traj high to low", "Rev Growth high to low",
+                "Momentum Score high", "52W Pos low to high",
+                "P/E vs Sector Med low to high",
+            ],
+            key=f"{key_prefix}_sort",
+        )
+        mc_min_l = st.number_input(
+            "Min Mkt Cap (LCr)", value=0, step=10, min_value=0,
+            key=f"{key_prefix}_mc_min",
+        )
+        pe_max = st.number_input(
+            "Max P/E", value=9999, step=50, min_value=0,
+            key=f"{key_prefix}_pe_max",
+        )
+        qual_min_f = st.number_input(
+            "Min Quality Score", value=0.0, step=5.0,
+            min_value=0.0, max_value=100.0,
+            key=f"{key_prefix}_qual_min",
+        )
 
     # ── Apply filters & sort ─────────────────────────────────────────────────
     filt = scr.copy()
@@ -384,6 +400,7 @@ def _render_screener_page(scr: pd.DataFrame, title: str, csv_prefix: str):
         data=disp_final.to_csv(index=False).encode("utf-8"),
         file_name=f"{csv_prefix}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv",
+        key=f"{key_prefix}_download",
     )
 
 
