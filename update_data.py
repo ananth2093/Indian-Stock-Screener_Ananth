@@ -5,8 +5,8 @@ Runs the legacy screener pipeline with a minimal Streamlit stub, then persists
 Nifty 50 / Nifty 500 snapshots, a prediction archive, and price history.
 """
 
-import importlib.util
 import os
+import runpy
 import sys
 import types
 import uuid
@@ -176,14 +176,11 @@ if not _should_update(data_dir):
 # ── Run screener_app_legacy.py headlessly ──────────────────────────────────
 sys.modules["streamlit"] = _build_streamlit_stub()
 
-spec = importlib.util.spec_from_file_location("screener_app", SCREENER_PATH)
-screener_mod = importlib.util.module_from_spec(spec)
-
-# Force it to run its top-level (guarded) block as __main__.
-screener_mod.__name__ = "__main__"
-
+# runpy executes the script with __name__ == "__main__", so the guarded top-level
+# block (page setup + data fetch + UI rendering) runs normally.  Rendering calls hit
+# the no-op stub and return immediately.
 try:
-    spec.loader.exec_module(screener_mod)
+    runpy.run_path(SCREENER_PATH, run_name="__main__")
 except SystemExit:
     pass
 

@@ -2,9 +2,10 @@ name: Update screener snapshots
 
 on:
   schedule:
-    # Every 4 hours while the Indian market is active (roughly 03:45-11:30 UTC).
-    # The script itself throttles to hourly during market hours and 4h otherwise.
-    - cron: '0 */4 * * *'
+    # Run every hour. The script throttles itself:
+    # - updates every hour while the Indian market is open (09:15-15:30 IST)
+    # - at most every 4 hours outside market hours / on weekends
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 permissions:
