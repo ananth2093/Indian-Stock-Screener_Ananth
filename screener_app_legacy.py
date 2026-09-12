@@ -1617,21 +1617,47 @@ For Financials (banks/NBFCs), ROE is used instead and Op Margin is excluded from
 def render_reference_guide():
     st.markdown("## Reference Sheet — How Every Metric Works")
     st.caption(
-        "Formulas, numeric examples, scoring logic, and benchmarks. "
-        "v10.1 — dual-source (yfinance + Google Finance), sector-adaptive weights, true ROIC."
+        "Formulas, numeric examples, scoring logic, benchmarks, and a full column glossary. "
+        "v10.2 — dual-source (yfinance + Google Finance), sector-adaptive weights, true ROIC."
     )
 
-    tab_val, tab_qual, tab_peg, tab_etraj, tab_mom, tab_rank, tab_disp, tab_gaps = st.tabs([
-        "Valuation", "Quality", "PEG", "Earn Traj",
-        "Momentum", "Scoring & Rank", "Display Metrics", "Data Gaps",
+    tab_over, tab_val, tab_qual, tab_peg, tab_etraj, tab_mom, tab_score, tab_gloss, tab_gaps = st.tabs([
+        "Overview", "Valuation", "Quality", "PEG", "Earn Traj",
+        "Momentum", "Scoring & Rank", "Full Column Glossary", "Data Gaps",
     ])
+
+    with tab_over:
+        st.markdown("""
+### What this screener does
+This dashboard ranks stocks using five factors:
+1. **Valuation** — how cheap or expensive a stock is relative to its earnings and growth.
+2. **Quality** — how profitable and conservatively financed the business is.
+3. **PEG** — price/earnings relative to expected earnings growth.
+4. **Earnings Trajectory** — whether forward earnings are expected to rise or fall.
+5. **Momentum** — whether the stock price is trending up, adjusted for volatility.
+
+Every stock is scored **within its sector**, because a bank and a tech company should not be compared with the same P/E yardstick.
+
+### Key jargon
+- **Market cap (Mkt Cap)** — total value of all outstanding shares.
+- **Lakh Crore (LCr)** — Indian numbering unit; 1 LCr = ₹100,000 crore.
+- **Sector-relative scoring** — percentiles are calculated using only the stock's sector peers.
+- **Risk-adjusted return** — return divided by volatility; a 20% gain with 5% volatility is better than a 20% gain with 50% volatility.
+""")
 
     with tab_val:
         st.markdown("""
-### P/E — Price to Earnings Ratio (Trailing)
-**Formula:** `Current Stock Price / Trailing 12-Month EPS`
+### Valuation metrics
+| Column | Definition | Why it matters |
+|---|---|---|
+| **P/E** | Price per share / trailing 12-month EPS. | Lower often means cheaper, but very low can signal distress. |
+| **Fwd P/E** | Price / next-12-month estimated EPS. | Looks at future earnings rather than past earnings. |
+| **P/E vs Sector Med** | Stock P/E ÷ median P/E of its sector. | 1.0 = sector median; <1 cheaper than peers; >1 pricier. |
+| **Mkt Cap (LCr)** | Total market value, in lakh crore. | Size classification; large-caps tend to be more stable. |
+| **MC% of Index** | Stock market cap ÷ total index market cap × 100. | How much the stock influences the Nifty 50/500 index. |
 
-| Sector | Typical Median P/E |
+### Typical P/E ranges by sector
+| Sector | Typical median P/E |
 |---|---|
 | Information Technology | 24–32 |
 | Consumer Staples (FMCG) | 40–55 |
@@ -1643,35 +1669,23 @@ def render_reference_guide():
 | Utilities | 12–18 |
 | Consumer Discretionary | 25–45 |
 
-**Used in scoring?** Yes — Valuation factor. Sector-adaptive weight 20–38%.
-
----
-### Fwd P/E — Forward Price to Earnings
-**Formula:** `Current Stock Price / Next 12-Month Estimated EPS`
-
-Preferred over trailing P/E for valuation scoring (v10+).
-
----
-### MC% of Index
-**Formula:** `Stock Market Cap / Sum of All Index Market Caps × 100`
-Display only.
-
----
-### 52W Pos%
-**Formula:** `(Current Price − 52W Low) / (52W High − 52W Low) × 100`
-0% = 52-week low. 100% = 52-week high. Display only.
+**Important:** P/E is sector-specific. A utility with P/E 20 and a tech stock with P/E 20 mean different things, which is why scoring is done inside each sector.
 """)
 
     with tab_qual:
         st.markdown("""
-### Quality Score (0–100)
-**Financials sector:** ROE as primary metric; Op Margin excluded.
-**All others:** `(ROIC sub-score + Int Coverage sub-score + Op Margin sub-score) / 3`
+### Quality metrics
+| Column | Definition | Why it matters |
+|---|---|---|
+| **ROIC%** | Return on Invested Capital: NOPAT / (Equity + Debt − Cash) × 100. | Measures how efficiently the company turns capital into profit. Higher = better. |
+| **ROE%** | Return on Equity: Net Income / Shareholders' Equity × 100. | Profit generated per unit of shareholder money. Primary metric for Financials. |
+| **Int Coverage** | EBIT / Interest Expense. | Ability to pay interest on debt. >3x is generally safe. |
+| **Op Margin%** | Operating Income / Revenue × 100. | Profit per rupee of sales before interest and taxes. Higher = pricing power. |
+| **Debt/Eq** | Total Debt / Shareholders' Equity. | Leverage check. Very high means heavy reliance on debt. |
+| **Quality Score** | Composite 0–100 of profitability, interest coverage, and operating margin. | One-number summary of fundamental health. |
+| **Quality Flag** | Labels showing which thresholds a stock failed. | Pass = all thresholds met; otherwise shows ROIC<8%, IntCov<3x, Margin<5%, etc. |
 
-### ROIC% — True Computation
-`NOPAT / (Equity + Debt − Cash) × 100`
-NOPAT = Operating Income × (1 − effective tax rate)
-
+### ROIC benchmarks
 | ROIC | Assessment |
 |---|---|
 | 25%+ | Best-in-class |
@@ -1679,18 +1693,15 @@ NOPAT = Operating Income × (1 − effective tax rate)
 | 8% | Minimum threshold |
 | Below 8% | Flagged |
 
-### Int Coverage
-`EBIT / |Interest Expense|` — below 3x is flagged.
-
-### Op Margin%
-`Operating Income / Revenue × 100` — below 5% flagged (non-Financials).
+### Interest coverage
+- **Below 3x** → flagged: the company may struggle to cover interest payments.
+- **Above 5x** → generally comfortable.
 """)
 
     with tab_peg:
         st.markdown("""
 ### PEG — Price/Earnings-to-Growth
 **Formula:** `P/E / Annual EPS Growth Rate (%)`
-Only computed when EPS growth ≥ 5%.
 
 | PEG | Signal |
 |---|---|
@@ -1698,40 +1709,63 @@ Only computed when EPS growth ≥ 5%.
 | 1.0–2.0 | Fairly valued |
 | Above 2.0 | Expensive |
 
-**Source waterfall:** Yahoo `pegRatio` → Calculated from EPS growth.
+- Only computed when EPS growth ≥ 5%.
+- Lower is generally better.
+- The **PEG Method** column tells you which source was used: Yahoo pegRatio, Yahoo EPS growth, or an Earn Traj proxy.
+
+**Example:** P/E = 20, EPS growth = 15% → PEG = 20 / 15 = 1.33.
 """)
 
     with tab_etraj:
         st.markdown("""
 ### Earn Traj — Earnings Trajectory
-`(Forward EPS − Trailing EPS) / |Trailing EPS|` clipped to [−1.0, +1.0]
+**Formula:** `(Forward EPS − Trailing EPS) / |Trailing EPS|` clipped to [−1.0, +1.0]
 
 | Range | Signal |
 |---|---|
-| +0.5 to +1.0 | Strong recovery |
+| +0.5 to +1.0 | Strong expected growth |
 | +0.1 to +0.3 | Moderate growth |
-| Near 0 | Flat |
+| Near 0 | Flat earnings |
 | −0.1 to −0.5 | Earnings pressure |
+
+- Shows whether analysts expect earnings to improve or deteriorate.
+- The clip stops extreme values (e.g., from a tiny loss to a big profit) from distorting the score.
+
+**Example:** Trailing EPS = ₹10, Forward EPS = ₹13 → Earn Traj = (13 − 10) / 10 = +0.30.
 """)
 
     with tab_mom:
         st.markdown("""
-### Momentum Score
-`(6-month return − 1-month return) / Trailing 90-day Annualised Volatility`
-
-Skip-month removes short-term reversal noise.
-Higher = more durable trend per unit of risk.
+### Momentum metrics
+| Column | Definition | Why it matters |
+|---|---|---|
+| **Ret 1Mo%** | Price return over the last ~1 month. | Short-term trend. |
+| **Ret 3Mo%** | Price return over the last ~3 months. | Medium-term trend. |
+| **Ret 6Mo%** | Price return over the last ~6 months. | Longer-term trend. |
+| **Trailing Vol%** | Annualised standard deviation of daily returns. | Measures how much the price jumps around. |
+| **52W Pos%** | `(Current Price − 52W Low) / (52W High − 52W Low) × 100`. | 0% = 52-week low; 100% = 52-week high. |
+| **Momentum Score** | `(6-month return − 1-month return) / Trailing Volatility` | Risk-adjusted trend strength; higher = more durable trend. |
 
 ### Why momentum matters in stock screening
 - **Price follows fundamentals, but with a lag.** Momentum captures which stocks the market is already rewarding.
 - **Avoids value traps.** A cheap stock can stay cheap for years; positive momentum shows buyers are stepping in.
 - **Risk-adjusted view.** Dividing return by volatility tells you whether a stock is trending smoothly or making lottery-like spikes.
-- **Best combined with quality/valuation.** High momentum + reasonable valuation + strong quality = a higher-conviction idea.
+- **Best combined with quality/valuation.** High momentum + reasonable valuation + strong quality = higher-conviction idea.
 """)
 
-    with tab_rank:
+    with tab_score:
         st.markdown("""
-### Sector-Adaptive Weights
+### Scoring & Rank
+| Column | Definition | Why it matters |
+|---|---|---|
+| **Score** | Sector-relative composite 0–100. Blend of Valuation, Quality, PEG, Earn Traj, Momentum using sector-adaptive weights. | Main ranking signal. |
+| **Overall Score** | Same as **Score**; shown for consistency with the S&P 500 dashboard. | Main ranking signal. |
+| **Rank** | Position within the stock's sector after sorting by Score descending. | 1 = best in sector. |
+| **Conviction Score** | Adjusted confidence in the Score. Penalises missing data and mixed signals, then rescaled 0–100. | Higher = more reliable ranking. |
+| **MC% of Index** | Market-cap weight in the Nifty 50/500 index. | Shows index influence. |
+
+### Sector-adaptive weights
+Every sector has its own factor weights because some signals are more predictive than others.
 
 | Sector | Val | Quality | PEG | Earn | Mom |
 |---|---|---|---|---|---|
@@ -1742,13 +1776,13 @@ Higher = more durable trend per unit of risk.
 | Industrials | 25% | 28% | 18% | 17% | 12% |
 | Consumer Staples | 28% | 32% | 10% | 15% | 15% |
 | Financials | 30% | 25% | 18% | 17% | 10% |
-| Energy | 30% | 18% | 12% | 15% | 25% |
+| Energy / Oil, Gas & Consumable Fuels | 30% | 18% | 12% | 15% | 25% |
 | Materials | 28% | 20% | 12% | 15% | 25% |
 | Real Estate | 30% | 18% | 10% | 22% | 20% |
 | Utilities | 38% | 27% | 5% | 15% | 15% |
 
-### Missing Factor Penalty
-| Missing | Multiplier |
+### Missing factor penalty
+| Missing factors | Score multiplier |
 |---|---|
 | 0 | ×1.00 |
 | 1 | ×0.95 |
@@ -1756,28 +1790,41 @@ Higher = more durable trend per unit of risk.
 | 3+ | ×0.70 |
 """)
 
-    with tab_disp:
+    with tab_gloss:
         st.markdown("""
-### Data Sources Column
-Per-row audit trail showing which source provided each metric.
-- `Yahoo` = yfinance
-- `GFinance` = Google Finance fallback
-
-### Rev Growth% (CAGR)
-`(Newest quarter / Revenue 4 quarters ago)^(1/3) − 1 × 100`
-
-### Data Coverage (typical .NS tickers)
-| Metric | yfinance | + Google Finance |
+### Full column glossary
+| Column | Definition | Interpretation |
 |---|---|---|
-| Price | ~60–80% | ~95%+ |
-| P/E | ~70% | ~90%+ |
-| Fwd P/E | ~60% | ~75% |
-| MC, 52W | ~70% | ~95% |
-| ROE, Op Margin | ~70% | ~88% |
-| ROIC (computed) | ~55% | ~55% |
-| Int Coverage | ~60% | ~60% |
-| Earn Traj | ~75% | ~75% |
-| Momentum | ~95% | ~95% |
+| **Ticker** | NSE trading symbol. | e.g. RELIANCE, INFY. |
+| **Sector** | Industry classification from the Nifty universe. | Used for peer-relative scoring. |
+| **Price (Rs)** | Latest closing price in Indian Rupees. | |
+| **Mkt Cap (LCr)** | Market cap in lakh crore (LCr). | 1 LCr = ₹100,000 crore. |
+| **MC% of Index** | Stock weight in the Nifty 50/500 index. | Sum across all stocks = 100%. |
+| **Overall Score / Score** | Composite 0–100 sector-relative score. | Higher = better combined ranking. |
+| **P/E** | Trailing price-to-earnings. | Lower can be cheaper; compare within sector. |
+| **P/E vs Sector Med** | Stock P/E ÷ sector median P/E. | <1 cheaper than peers; >1 pricier. |
+| **Fwd P/E** | Forward price-to-earnings. | Based on estimated future earnings. |
+| **PEG** | P/E / EPS growth rate. | <1 potentially undervalued; >2 expensive. |
+| **PEG Method** | Source used to compute PEG. | Audit trail. |
+| **Earn Traj** | Normalised earnings direction. | +1 strong growth, −1 decline. |
+| **ROIC%** | Return on invested capital. | Efficiency of capital use; >8% target. |
+| **ROE%** | Return on equity. | Profit per unit of shareholder equity. |
+| **Int Coverage** | EBIT / interest expense. | Debt safety; >3x preferred. |
+| **Op Margin%** | Operating profit margin. | Pricing power; >5% target (ex-Financials). |
+| **Debt/Eq** | Debt-to-equity ratio. | Lower is generally safer. |
+| **Quality Score** | Composite 0–100 quality score. | Higher = stronger fundamentals. |
+| **Quality Flag** | Threshold failure labels. | Pass = all good. |
+| **Momentum Score** | Risk-adjusted momentum. | Higher = stronger trend. |
+| **Ret 1Mo%** | ~1-month price return. | Short-term trend. |
+| **Ret 3Mo%** | ~3-month price return. | Medium-term trend. |
+| **Ret 6Mo%** | ~6-month price return. | Longer-term trend. |
+| **Trailing Vol%** | Annualised volatility. | Risk measure. |
+| **52W Pos%** | Position in 52-week range. | 100% = 52-week high. |
+| **Rank** | Sector rank by Score. | 1 = best in sector. |
+| **Conviction Score** | Confidence-adjusted Score. | Higher = more reliable. |
+| **Rev Growth% (CAGR)** | Revenue CAGR across the last 4 quarters. | Growth measure. |
+| **Rev Q1...Q4 (1000Cr)** | Quarterly revenue in ₹1,000 crore units. | e.g. 0.46 = ₹460 crore. |
+| **Data Sources** | Audit trail of which source filled each metric. | Yahoo, GFinance, Computed. |
 """)
 
     with tab_gaps:
@@ -1788,8 +1835,8 @@ Empty cells in the screener simply mean **the data was not available** for that 
 Common reasons:
 | Reason | What it means |
 |---|---|
-| **New listing / SPAC / recent IPO** | Some tickers have no full-year history yet. |
-| **Yahoo Finance rate limiting** | Heavy batch requests can be throttled, especially for 500 stocks. The new bulk momentum download reduces this, but gaps can still happen. |
+| **New listing / recent IPO** | The ticker has no full-year price or earnings history yet. |
+| **Yahoo Finance rate limiting** | Heavy batch requests can be throttled. The new bulk momentum download reduces this, but gaps can still happen. |
 | **No reported earnings** | Some small-cap or loss-making companies do not report the required quarterly data. |
 | **Different fiscal years** | Quarterly revenue timestamps may not line up, causing Rev Growth to be blank. |
 | **Google Finance fallback not triggered** | Fallbacks are used only when Yahoo returns nothing; they do not always fill every field. |
