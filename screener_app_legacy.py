@@ -1621,9 +1621,9 @@ def render_reference_guide():
         "v10.2 — dual-source (yfinance + Google Finance), sector-adaptive weights, true ROIC."
     )
 
-    tab_over, tab_val, tab_qual, tab_peg, tab_etraj, tab_mom, tab_score, tab_gloss, tab_gaps = st.tabs([
+    tab_over, tab_val, tab_qual, tab_peg, tab_etraj, tab_mom, tab_score, tab_gloss, tab_examples, tab_gaps = st.tabs([
         "Overview", "Valuation", "Quality", "PEG", "Earn Traj",
-        "Momentum", "Scoring & Rank", "Full Column Glossary", "Data Gaps",
+        "Momentum", "Scoring & Rank", "Full Column Glossary", "Worked Examples", "Data Gaps",
     ])
 
     with tab_over:
@@ -1825,6 +1825,100 @@ Every sector has its own factor weights because some signals are more predictive
 | **Rev Growth% (CAGR)** | Revenue CAGR across the last 4 quarters. | Growth measure. |
 | **Rev Q1...Q4 (1000Cr)** | Quarterly revenue in ₹1,000 crore units. | e.g. 0.46 = ₹460 crore. |
 | **Data Sources** | Audit trail of which source filled each metric. | Yahoo, GFinance, Computed. |
+""")
+
+    with tab_examples:
+        st.markdown("""
+### Worked examples — how the numbers are calculated
+
+#### P/E (Price-to-Earnings)
+**Formula:** `P/E = Stock Price / Earnings Per Share (EPS)`
+
+- If **Apple** stock price = **$200** and trailing 12-month EPS = **$8**, then:
+  - P/E = 200 / 8 = **25**
+- A P/E of 25 means investors are paying $25 for every $1 of past-year earnings.
+- Compare this to Apple's sector median. If Tech sector median P/E = 28, then P/E vs Sector Med = 25 / 28 = **0.89** → cheaper than peers.
+
+#### Fwd P/E (Forward P/E)
+**Formula:** `Fwd P/E = Stock Price / Expected Next-12-Month EPS`
+
+- If stock price = $200 and expected EPS = $10, then:
+  - Fwd P/E = 200 / 10 = **20**
+- Lower than trailing P/E → expected earnings growth.
+
+#### PEG
+**Formula:** `PEG = P/E / Annual EPS Growth Rate`
+
+- If P/E = 25 and expected EPS growth = 15%, then:
+  - PEG = 25 / 15 = **1.67**
+- Below 1.0 is attractive; 1.0–2.0 is fair; above 2.0 is expensive.
+
+#### ROIC% (Return on Invested Capital)
+**Formula:** `ROIC = Net Operating Profit After Tax / (Equity + Debt − Cash) × 100`
+
+- Suppose a company has:
+  - NOPAT = ₹500 crore
+  - Equity = ₹2,000 crore, Debt = ₹1,000 crore, Cash = ₹200 crore
+  - Invested Capital = 2,000 + 1,000 − 200 = **₹2,800 crore**
+  - ROIC = 500 / 2,800 × 100 = **17.9%**
+- >15% is excellent; <8% is flagged.
+
+#### ROE% (Return on Equity)
+**Formula:** `ROE = Net Income / Shareholders' Equity × 100`
+
+- Net Income = ₹200 crore, Equity = ₹1,000 crore
+  - ROE = 200 / 1,000 × 100 = **20%**
+- For Financials, ROE is the primary quality metric instead of ROIC.
+
+#### Int Coverage (Interest Coverage)
+**Formula:** `Int Coverage = EBIT / Interest Expense`
+
+- EBIT = ₹300 crore, Interest Expense = ₹50 crore
+  - Int Coverage = 300 / 50 = **6x**
+- >3x is safe; <3x is flagged.
+
+#### Op Margin% (Operating Margin)
+**Formula:** `Op Margin = Operating Income / Revenue × 100`
+
+- Operating Income = ₹400 crore, Revenue = ₹2,000 crore
+  - Op Margin = 400 / 2,000 × 100 = **20%**
+- >5% is the default threshold (higher for some sectors).
+
+#### Earn Traj (Earnings Trajectory)
+**Formula:** `(Forward EPS − Trailing EPS) / |Trailing EPS|`, clipped to [−1, +1]
+
+- Trailing EPS = ₹10, Forward EPS = ₹13
+  - Earn Traj = (13 − 10) / 10 = **+0.30**
+- A positive number means expected earnings growth; negative means expected decline.
+
+#### Momentum Score
+**Formula:** `(6-month return − 1-month return) / Trailing Volatility`
+
+- 6-month return = +18%, 1-month return = +5%, Trailing Volatility = 25%
+  - Skip-month raw = 18 − 5 = 13%
+  - Momentum Score = 13 / 25 = **0.52**
+- Higher values indicate a smoother, stronger uptrend.
+
+#### Rev Growth% (CAGR)
+**Formula:** `(Newest Quarter Revenue / Revenue 4 Quarters Ago)^(1/3) − 1 × 100`
+
+- Q4 (newest) = ₹120 crore, Q1 (4 quarters ago) = ₹100 crore
+  - CAGR = (120 / 100)^(1/3) − 1 = **6.3%**
+- Shows 3-quarter compound revenue growth.
+
+#### MC% of Index
+**Formula:** `Stock Market Cap / Total Index Market Cap × 100`
+
+- Reliance market cap = ₹18 lakh crore, total Nifty 50 market cap = ₹180 lakh crore
+  - MC% of Index = 18 / 180 × 100 = **10%**
+- Reliance makes up 10% of the index.
+
+#### Debt/Eq
+**Formula:** `Total Debt / Shareholders' Equity`
+
+- Debt = ₹500 crore, Equity = ₹1,000 crore
+  - Debt/Eq = 500 / 1,000 = **0.5**
+- <1 is generally conservative; >2 is high leverage.
 """)
 
     with tab_gaps:
