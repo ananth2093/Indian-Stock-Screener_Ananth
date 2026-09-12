@@ -179,7 +179,8 @@ def _button(*args, **kwargs):
 
 
 def _stop():
-    raise SystemExit(0)
+    print("[stub] st.stop() called")
+    return
 
 
 def _build_streamlit_stub():
@@ -199,7 +200,7 @@ def _build_streamlit_stub():
         "metric": lambda *a, **k: None,
         "info": lambda *a, **k: None,
         "warning": lambda *a, **k: None,
-        "error": lambda *a, **k: None,
+        "error": lambda *a, **k: print("[stub st.error]", a, k),
         "caption": lambda *a, **k: None,
         "success": lambda *a, **k: None,
         "dataframe": lambda *a, **k: None,
@@ -243,8 +244,11 @@ sys.modules["streamlit"] = _build_streamlit_stub()
 # the no-op stub and return immediately.
 try:
     runpy.run_path(SCREENER_PATH, run_name="__main__")
-except SystemExit:
-    pass
+except SystemExit as e:
+    print(f"[update_data] screener_app_legacy.py exited with code {e.code}")
+except Exception:
+    import traceback
+    traceback.print_exc()
 
 st_stub = sys.modules["streamlit"]
 scr50 = st_stub.session_state.get("scr50")
