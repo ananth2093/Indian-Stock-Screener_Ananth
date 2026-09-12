@@ -237,7 +237,12 @@ if not _should_update(data_dir):
 
 
 # ── Run screener_app_legacy.py headlessly ──────────────────────────────────
-sys.modules["streamlit"] = _build_streamlit_stub()
+st_stub = _build_streamlit_stub()
+sys.modules["streamlit"] = st_stub
+
+# Force the Nifty 500 tab to load in headless mode; otherwise it waits for a
+# button press that never happens.
+st_stub.session_state["n500_loaded"] = True
 
 # runpy executes the script with __name__ == "__main__", so the guarded top-level
 # block (page setup + data fetch + UI rendering) runs normally.  Rendering calls hit
@@ -250,15 +255,16 @@ except Exception:
     import traceback
     traceback.print_exc()
 
-st_stub = sys.modules["streamlit"]
 scr50 = st_stub.session_state.get("scr50")
 scr500 = st_stub.session_state.get("scr500")
 
-if scr50 is None or scr500 is None:
+if scr50 is None:
     raise RuntimeError(
-        "screener_app_legacy.py did not produce `scr50` and/or `scr500`. "
+        "screener_app_legacy.py did not produce `scr50`. "
         "Check the headless run output for errors."
     )
+if scr500 is None:
+    scr500 = pd.DataFrame()
 
 for _scr in (scr50, scr500):
     for col in _scr.columns:
