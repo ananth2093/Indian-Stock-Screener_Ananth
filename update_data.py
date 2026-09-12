@@ -55,7 +55,7 @@ def _should_update(data_dir: Path) -> bool:
     return elapsed >= 4 * 3600 - 100  # ~4 hours
 
 
-# ── Minimal Streamlit stub ───────────────────────────────────────────────────
+# ── Streamlit stub for headless execution ─────────────────────────────────────
 class _NoOp:
     """A do-nothing object that is also a context manager and callable."""
 
@@ -83,26 +83,51 @@ class _NoOp:
     def __getitem__(self, key):
         return _NoOp()
 
-    def __eq__(self, other):
+
+class _Widget:
+    """A stub that returns sensible defaults for common Streamlit widgets."""
+
+    def selectbox(self, label, options, *args, **kwargs):
+        return (options[0] if options else None)
+
+    def multiselect(self, label, options, *args, **kwargs):
+        return kwargs.get("default") or (options[:1] if options else [])
+
+    def number_input(self, label, *args, **kwargs):
+        return kwargs.get("value")
+
+    def slider(self, label, *args, **kwargs):
+        return kwargs.get("value")
+
+    def text_input(self, label, *args, **kwargs):
+        return kwargs.get("value", "")
+
+    def button(self, *args, **kwargs):
         return False
 
-    def __ne__(self, other):
-        return True
-
-    def __lt__(self, other):
+    def download_button(self, *args, **kwargs):
         return False
 
-    def __le__(self, other):
+    def checkbox(self, *args, **kwargs):
+        return kwargs.get("value", False)
+
+    def radio(self, label, options, *args, **kwargs):
+        return (options[0] if options else None)
+
+    def segmented_control(self, label, options, *args, **kwargs):
+        return kwargs.get("default") or (options[0] if options else None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
         return False
 
-    def __gt__(self, other):
-        return False
+    def __call__(self, *args, **kwargs):
+        return _Widget()
 
-    def __ge__(self, other):
-        return False
-
-    def __hash__(self):
-        return id(self)
+    def __getattr__(self, name):
+        return _Widget()
 
 
 def _cache_data_decorator(fn):
@@ -114,11 +139,27 @@ _cache_data_decorator.clear = lambda: None
 
 def _make_columns(n, *args, **kwargs):
     count = len(n) if isinstance(n, (list, tuple)) else int(n)
-    return tuple(_NoOp() for _ in range(count))
+    return tuple(_Widget() for _ in range(count))
 
 
 def _make_tabs(labels, *args, **kwargs):
-    return [_NoOp() for _ in labels]
+    return [_Widget() for _ in labels]
+
+
+def _make_sidebar():
+    return _Widget()
+
+
+def _make_expander(*args, **kwargs):
+    return _Widget()
+
+
+def _make_empty(*args, **kwargs):
+    return _Widget()
+
+
+def _make_progress(*args, **kwargs):
+    return _NoOp()
 
 
 def _selectbox(label, options, *args, **kwargs):
@@ -148,9 +189,9 @@ def _build_streamlit_stub():
         "markdown": lambda *a, **k: None,
         "columns": _make_columns,
         "tabs": _make_tabs,
-        "sidebar": _NoOp(),
+        "sidebar": _make_sidebar(),
         "spinner": lambda *a, **k: _NoOp(),
-        "expander": lambda *a, **k: _NoOp(),
+        "expander": _make_expander,
         "button": _button,
         "selectbox": _selectbox,
         "number_input": _number_input,
@@ -170,8 +211,8 @@ def _build_streamlit_stub():
         "stop": _stop,
         "session_state": {},
         "secrets": {},
-        "empty": lambda *a, **k: _NoOp(),
-        "progress": lambda *a, **k: _NoOp(),
+        "empty": _make_empty,
+        "progress": _make_progress,
         "html": lambda *a, **k: None,
     })
 
